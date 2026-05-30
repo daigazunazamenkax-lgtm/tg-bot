@@ -976,9 +976,22 @@ async def run_web():
     print(f"Web server started on port {port}")
 
 
+async def notify_admins_on_start():
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(
+                admin_id,
+                "✅ Бот запущен и работает!\n🕐 " + __import__('datetime').datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+            )
+        except Exception:
+            pass
+
+
 async def main():
 
     print("BOT STARTED")
+
+    await notify_admins_on_start()
 
     await asyncio.gather(
         run_web(),
