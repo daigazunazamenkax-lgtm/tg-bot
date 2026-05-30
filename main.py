@@ -341,6 +341,28 @@ async def admin_panel(message: Message):
     )
 
 
+@dp.message(F.text == "/users")
+async def show_users(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    cursor.execute("SELECT user_id FROM users")
+    users = cursor.fetchall()
+
+    if not users:
+        await message.answer("👤 Пользователей пока нет.")
+        return
+
+    text = f"👥 Всего пользователей: {len(users)}\n\n"
+    ids = [str(u[0]) for u in users]
+    text += "\n".join(ids)
+
+    if len(text) > 4000:
+        text = text[:4000] + "\n..."
+
+    await message.answer(text)
+
+
 @dp.callback_query(F.data == "builds")
 async def builds(callback: CallbackQuery):
 
