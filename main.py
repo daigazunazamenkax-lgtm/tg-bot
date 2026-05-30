@@ -25,8 +25,8 @@ dp = Dispatcher()
 
 user_states = {}
 
-DB_PATH = os.environ.get("DB_PATH", "/data/bot.db")
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+DB_PATH = os.environ.get("DB_PATH", "bot/bot.db")
+os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
 db = sqlite3.connect(DB_PATH)
 cursor = db.cursor()
 
