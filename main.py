@@ -1014,6 +1014,23 @@ async def notify_admins_on_start():
             pass
 
 
+async def daily_backup():
+    import datetime
+    while True:
+        await asyncio.sleep(86400)
+        for admin_id in ADMINS:
+            try:
+                db.commit()
+                with open(DB_PATH, "rb") as f:
+                    await bot.send_document(
+                        admin_id,
+                        document=("bot_backup.db", f),
+                        caption=f"💾 Резервная копия БД\n🕐 {datetime.datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+                    )
+            except Exception:
+                pass
+
+
 async def main():
 
     print("BOT STARTED")
@@ -1022,7 +1039,8 @@ async def main():
 
     await asyncio.gather(
         run_web(),
-        dp.start_polling(bot)
+        dp.start_polling(bot),
+        daily_backup()
     )
 
 
