@@ -308,9 +308,6 @@ async def start(message: Message):
             if param.startswith("ref_"):
                 try:
                     referrer_id = int(param[4:])
-                    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (referrer_id,))
-                    if not cursor.fetchone():
-                        referrer_id = None
                 except Exception:
                     referrer_id = None
             else:
