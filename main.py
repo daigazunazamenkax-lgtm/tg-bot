@@ -456,6 +456,10 @@ async def build(callback: CallbackQuery):
 
     build_row = cursor.fetchone()
 
+    if not build_row:
+        await callback.message.answer("❌ Сборка не найдена.")
+        return
+
     cursor.execute(
         "UPDATE builds SET downloads = downloads + 1 WHERE id=?",
         (build_id,)
