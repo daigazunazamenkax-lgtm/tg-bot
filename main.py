@@ -304,16 +304,27 @@ async def start(message: Message):
 
     if param:
         try:
-            cursor.execute("SELECT user_id FROM users WHERE ref_code=?", (param,))
-            ref = cursor.fetchone()
-            if ref:
-                referrer_id = ref[0]
-                if referrer_id != message.from_user.id:
-                    cursor.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (referrer_id, message.from_user.id))
-                    db.commit()
+            referrer_id = None
+            if param.startswith("ref_"):
+                try:
+                    referrer_id = int(param[4:])
+                    cursor.execute("SELECT user_id FROM users WHERE user_id=?", (referrer_id,))
+                    if not cursor.fetchone():
+                        referrer_id = None
+                except Exception:
+                    referrer_id = None
+            else:
+                cursor.execute("SELECT user_id FROM users WHERE ref_code=?", (param,))
+                ref = cursor.fetchone()
+                if ref:
+                    referrer_id = ref[0]
 
-                    if await check_sub(message.from_user.id):
-                        await confirm_referral_if_pending(message.from_user.id)
+            if referrer_id and referrer_id != message.from_user.id:
+                cursor.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (referrer_id, message.from_user.id))
+                db.commit()
+
+                if await check_sub(message.from_user.id):
+                    await confirm_referral_if_pending(message.from_user.id)
         except Exception:
             pass
 
@@ -711,19 +722,8 @@ async def referral_panel(callback: CallbackQuery):
 
     user_id = callback.from_user.id
 
-    cursor.execute("SELECT ref_code FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-
-    if not row or not row[0]:
-        newcode = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
-        cursor.execute("UPDATE users SET ref_code=? WHERE user_id=?", (newcode, user_id))
-        db.commit()
-        ref_code = newcode
-    else:
-        ref_code = row[0]
-
     me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start={ref_code}"
+    link = f"https://t.me/{me.username}?start=ref_{user_id}"
 
     cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
     cnt = cursor.fetchone()[0]
@@ -762,19 +762,8 @@ async def ref_command(message: Message):
 
     user_id = message.from_user.id
 
-    cursor.execute("SELECT ref_code FROM users WHERE user_id=?", (user_id,))
-    row = cursor.fetchone()
-
-    if not row or not row[0]:
-        newcode = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
-        cursor.execute("UPDATE users SET ref_code=? WHERE user_id=?", (newcode, user_id))
-        db.commit()
-        ref_code = newcode
-    else:
-        ref_code = row[0]
-
     me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start={ref_code}"
+    link = f"https://t.me/{me.username}?start=ref_{user_id}"
 
     cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
     cnt = cursor.fetchone()[0]
