@@ -288,6 +288,10 @@ async def start(message: Message):
     param = parts[1].strip() if len(parts) > 1 else None
 
     async with db_lock:
+        # Проверяем — новый пользователь или уже был в боте
+        cursor.execute("SELECT user_id FROM users WHERE user_id=?", (message.from_user.id,))
+        is_new_user = cursor.fetchone() is None
+
         cursor.execute(
             "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
             (message.from_user.id,)
@@ -306,7 +310,7 @@ async def start(message: Message):
             ref_code = row[0]
 
         referrer_id = None
-        if param:
+        if param and is_new_user:
             if param.startswith("ref_"):
                 try:
                     referrer_id = int(param[4:])
@@ -323,7 +327,7 @@ async def start(message: Message):
                 db.commit()
 
     # await — за пределами лока
-    if param and referrer_id and referrer_id != message.from_user.id:
+    if param and is_new_user and referrer_id and referrer_id != message.from_user.id:
         try:
             if await check_sub(message.from_user.id):
                 await confirm_referral_if_pending(message.from_user.id)
