@@ -376,6 +376,68 @@ async def show_users(message: Message):
     await message.answer(text)
 
 
+@dp.message(F.text.startswith("/admin_unref"))
+async def admin_unref(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("❌ Формат: /admin_unref <user_id>")
+        return
+
+    try:
+        target_id = int(parts[1].strip())
+    except ValueError:
+        await message.answer("❌ Неверный user_id — должно быть число")
+        return
+
+    async with db_lock:
+        cursor.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=0", (target_id,))
+        pending = cursor.fetchone()
+
+        if not pending:
+            cursor.execute("SELECT 1 FROM referrals WHERE referred_id=?", (target_id,))
+            exists = cursor.fetchone()
+            if exists:
+                await message.answer(f"ℹ️ Реферал {target_id} уже подтверждён ранее")
+            else:
+                await message.answer(f"❌ Реферал {target_id} не найден в базе")
+            return
+
+        referral_id, referrer_id = pending
+        cursor.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
+        db.commit()
+
+        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+        cnt = cursor.fetchone()[0]
+
+        reward_to_send = None
+        if cnt >= 5:
+            cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+            reward_row = cursor.fetchone()
+            if reward_row:
+                cursor.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
+                already = cursor.fetchone()
+                if not already:
+                    reward_to_send = reward_row
+                    cursor.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
+                    db.commit()
+
+    await message.answer(f"✅ Реферал {target_id} вручную подтверждён. Реферер уведомлён.")
+
+    try:
+        await bot.send_message(referrer_id, f"✅ Ваш реферал был подтверждён администратором. Подтверждённых: {cnt}/5")
+    except Exception:
+        pass
+
+    if reward_to_send:
+        try:
+            await bot.send_message(referrer_id, f"🎁 Вы получили награду за 5 рефералов: {reward_to_send[1]}\n\nОбзор: {reward_to_send[2]}\nСсылка: {reward_to_send[3]}")
+        except Exception:
+            pass
+
+
 @dp.message(F.text == "/admin_refs")
 async def show_refs(message: Message):
     if message.from_user.id not in ADMINS:
