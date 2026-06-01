@@ -24,6 +24,7 @@ bot = Bot(TOKEN)
 dp = Dispatcher()
 
 user_states = {}
+db_lock = asyncio.Lock()
 
 DB_PATH = os.environ.get("DB_PATH", "bot/bot.db")
 os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
@@ -235,34 +236,33 @@ async def check_sub(user_id):
 
 async def confirm_referral_if_pending(user_id):
 
-    cursor.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=0", (user_id,))
-    pending = cursor.fetchone()
-    if not pending:
-        return
+    async with db_lock:
+        cursor.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=0", (user_id,))
+        pending = cursor.fetchone()
+        if not pending:
+            return
 
-    referral_id, referrer_id = pending
+        referral_id, referrer_id = pending
 
-    cursor.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
-    db.commit()
+        cursor.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
+        db.commit()
 
-    # Считаем количество ДО await, чтобы другие корутины не успели испортить курсор
-    cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
-    cnt = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+        cnt = cursor.fetchone()[0]
 
-    # Проверяем награду ДО await
-    reward_to_send = None
-    if cnt >= 5:
-        cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
-        reward_row = cursor.fetchone()
-        if reward_row:
-            cursor.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
-            already = cursor.fetchone()
-            if not already:
-                reward_to_send = reward_row
-                cursor.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
-                db.commit()
+        reward_to_send = None
+        if cnt >= 5:
+            cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+            reward_row = cursor.fetchone()
+            if reward_row:
+                cursor.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
+                already = cursor.fetchone()
+                if not already:
+                    reward_to_send = reward_row
+                    cursor.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
+                    db.commit()
 
-    # Теперь делаем await — курсор больше не нужен для считывания
+    # Все await — за пределами лока, курсор уже не нужен
     try:
         chat = await bot.get_chat(user_id)
         name = chat.username or chat.first_name or str(user_id)
@@ -287,27 +287,26 @@ async def start(message: Message):
     parts = message.text.split(maxsplit=1)
     param = parts[1].strip() if len(parts) > 1 else None
 
-    cursor.execute(
-        "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-        (message.from_user.id,)
-    )
-
-    db.commit()
-
-    cursor.execute("SELECT ref_code FROM users WHERE user_id=?", (message.from_user.id,))
-    row = cursor.fetchone()
-
-    if not row or not row[0]:
-        newcode = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
-        cursor.execute("UPDATE users SET ref_code=? WHERE user_id=?", (newcode, message.from_user.id))
+    async with db_lock:
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            (message.from_user.id,)
+        )
         db.commit()
-        ref_code = newcode
-    else:
-        ref_code = row[0]
 
-    if param:
-        try:
-            referrer_id = None
+        cursor.execute("SELECT ref_code FROM users WHERE user_id=?", (message.from_user.id,))
+        row = cursor.fetchone()
+
+        if not row or not row[0]:
+            newcode = ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+            cursor.execute("UPDATE users SET ref_code=? WHERE user_id=?", (newcode, message.from_user.id))
+            db.commit()
+            ref_code = newcode
+        else:
+            ref_code = row[0]
+
+        referrer_id = None
+        if param:
             if param.startswith("ref_"):
                 try:
                     referrer_id = int(param[4:])
@@ -323,8 +322,11 @@ async def start(message: Message):
                 cursor.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (referrer_id, message.from_user.id))
                 db.commit()
 
-                if await check_sub(message.from_user.id):
-                    await confirm_referral_if_pending(message.from_user.id)
+    # await — за пределами лока
+    if param and referrer_id and referrer_id != message.from_user.id:
+        try:
+            if await check_sub(message.from_user.id):
+                await confirm_referral_if_pending(message.from_user.id)
         except Exception:
             pass
 
