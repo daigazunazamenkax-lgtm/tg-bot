@@ -245,35 +245,38 @@ async def confirm_referral_if_pending(user_id):
     cursor.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
     db.commit()
 
+    # Считаем количество ДО await, чтобы другие корутины не успели испортить курсор
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+    cnt = cursor.fetchone()[0]
+
+    # Проверяем награду ДО await
+    reward_to_send = None
+    if cnt >= 5:
+        cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+        reward_row = cursor.fetchone()
+        if reward_row:
+            cursor.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
+            already = cursor.fetchone()
+            if not already:
+                reward_to_send = reward_row
+                cursor.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
+                db.commit()
+
+    # Теперь делаем await — курсор больше не нужен для считывания
     try:
         chat = await bot.get_chat(user_id)
         name = chat.username or chat.first_name or str(user_id)
     except Exception:
         name = str(user_id)
 
-    cnt = 0
     try:
-        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
-        cnt = cursor.fetchone()[0]
         await bot.send_message(referrer_id, f"✅ Ваш реферал {name} подтвердил подписку. Подтверждённых: {cnt}")
     except Exception:
         pass
 
-    if cnt >= 5:
+    if reward_to_send:
         try:
-            cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
-            reward = cursor.fetchone()
-            if reward:
-                reward_id = reward[0]
-                cursor.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_id))
-                already = cursor.fetchone()
-                if not already:
-                    try:
-                        await bot.send_message(referrer_id, f"🎁 Вы получили награду за 5 рефералов: {reward[1]}\n\nОбзор: {reward[2]}\nСсылка: {reward[3]}")
-                    except Exception:
-                        pass
-                    cursor.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_id))
-                    db.commit()
+            await bot.send_message(referrer_id, f"🎁 Вы получили награду за 5 рефералов: {reward_to_send[1]}\n\nОбзор: {reward_to_send[2]}\nСсылка: {reward_to_send[3]}")
         except Exception:
             pass
 
@@ -369,6 +372,40 @@ async def show_users(message: Message):
         text = text[:4000] + "\n..."
 
     await message.answer(text)
+
+
+@dp.message(F.text == "/admin_refs")
+async def show_refs(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    cursor.execute("""
+        SELECT r.referrer_id, r.referred_id, r.confirmed, r.ts
+        FROM referrals r
+        ORDER BY r.ts DESC
+    """)
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("📭 Рефералов пока нет.")
+        return
+
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE confirmed=1")
+    total_confirmed = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM referrals WHERE confirmed=0")
+    total_pending = cursor.fetchone()[0]
+
+    text = f"👥 Рефералы: всего {len(rows)} | ✅ подтверждено {total_confirmed} | ⏳ ожидает {total_pending}\n\n"
+
+    for r in rows:
+        referrer_id, referred_id, confirmed, ts = r
+        status = "✅" if confirmed else "⏳"
+        date = ts[:10] if ts else "?"
+        text += f"{status} {referrer_id} → {referred_id} | {date}\n"
+
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for chunk in chunks:
+        await message.answer(chunk)
 
 
 @dp.callback_query(F.data == "builds")
