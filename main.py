@@ -7,7 +7,7 @@ from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
-from aiogram.filters import ChatMemberUpdatedFilter, JOIN_TRANSITION
+from aiogram.filters import ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 TOKEN = os.environ.get("TOKEN")
@@ -1129,6 +1129,35 @@ async def on_user_join_channel(event: ChatMemberUpdated):
         return
     user_id = event.new_chat_member.user.id
     await confirm_referral_if_pending(user_id)
+
+
+@dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
+async def on_user_leave_channel(event: ChatMemberUpdated):
+    if event.chat.id != CHANNEL_ID:
+        return
+
+    user_id = event.new_chat_member.user.id
+
+    async with db_lock:
+        cursor.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=1", (user_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+
+        referral_id, referrer_id = row
+        cursor.execute("UPDATE referrals SET confirmed=0 WHERE id=?", (referral_id,))
+        db.commit()
+
+        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+        cnt = cursor.fetchone()[0]
+
+    try:
+        await bot.send_message(
+            referrer_id,
+            f"❌ Ваш реферал отписался от канала — реферал аннулирован.\nПодтверждённых: {cnt}/5"
+        )
+    except Exception:
+        pass
 
 
 async def main():
