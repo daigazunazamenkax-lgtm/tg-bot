@@ -6,7 +6,8 @@ import string
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
+from aiogram.filters import ChatMemberUpdatedFilter, JOIN_TRANSITION
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 TOKEN = os.environ.get("TOKEN")
@@ -1122,6 +1123,14 @@ async def daily_backup():
                 pass
 
 
+@dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
+async def on_user_join_channel(event: ChatMemberUpdated):
+    if event.chat.id != CHANNEL_ID:
+        return
+    user_id = event.new_chat_member.user.id
+    await confirm_referral_if_pending(user_id)
+
+
 async def main():
 
     print("BOT STARTED")
@@ -1130,7 +1139,7 @@ async def main():
 
     await asyncio.gather(
         run_web(),
-        dp.start_polling(bot),
+        dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_member"]),
         daily_backup()
     )
 
