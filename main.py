@@ -477,6 +477,25 @@ async def show_refs(message: Message):
         await message.answer(chunk)
 
 
+@dp.message(F.text == "/admin_banlist")
+async def admin_banlist(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    cursor.execute("SELECT user_id FROM users WHERE blacklisted=1")
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("✅ Чёрный список пуст.")
+        return
+
+    text = f"🚫 Чёрный список ({len(rows)} чел.):\n\n"
+    for row in rows:
+        text += f"• {row[0]}\n"
+
+    await message.answer(text)
+
+
 @dp.message(F.text.startswith("/admin_ban"))
 async def admin_ban(message: Message):
     if message.from_user.id not in ADMINS:
@@ -532,25 +551,6 @@ async def admin_unban(message: Message):
         await bot.send_message(target_id, "✅ Вы удалены из чёрного списка бота. Добро пожаловать обратно!")
     except Exception:
         pass
-
-
-@dp.message(F.text == "/admin_banlist")
-async def admin_banlist(message: Message):
-    if message.from_user.id not in ADMINS:
-        return
-
-    cursor.execute("SELECT user_id FROM users WHERE blacklisted=1")
-    rows = cursor.fetchall()
-
-    if not rows:
-        await message.answer("✅ Чёрный список пуст.")
-        return
-
-    text = f"🚫 Чёрный список ({len(rows)} чел.):\n\n"
-    for row in rows:
-        text += f"• {row[0]}\n"
-
-    await message.answer(text)
 
 
 @dp.callback_query(F.data == "builds")
