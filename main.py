@@ -477,6 +477,82 @@ async def show_refs(message: Message):
         await message.answer(chunk)
 
 
+@dp.message(F.text.startswith("/admin_ban"))
+async def admin_ban(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("❌ Использование: /admin_ban <user_id>")
+        return
+
+    target_id = int(parts[1].strip())
+
+    async with db_lock:
+        cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target_id,))
+        cursor.execute("UPDATE users SET blacklisted=1 WHERE user_id=?", (target_id,))
+        db.commit()
+
+    await message.answer(f"🚫 Пользователь {target_id} добавлен в ЧС.")
+
+    try:
+        await bot.send_message(target_id, "❌ Вы добавлены в чёрный список бота. Обратитесь к администрации.")
+    except Exception:
+        pass
+
+
+@dp.message(F.text.startswith("/admin_unban"))
+async def admin_unban(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip().isdigit():
+        await message.answer("❌ Использование: /admin_unban <user_id>")
+        return
+
+    target_id = int(parts[1].strip())
+
+    async with db_lock:
+        cursor.execute("SELECT blacklisted FROM users WHERE user_id=?", (target_id,))
+        row = cursor.fetchone()
+        if not row:
+            await message.answer(f"⚠️ Пользователь {target_id} не найден в базе.")
+            return
+        if row[0] != 1:
+            await message.answer(f"⚠️ Пользователь {target_id} не в ЧС.")
+            return
+        cursor.execute("UPDATE users SET blacklisted=0 WHERE user_id=?", (target_id,))
+        db.commit()
+
+    await message.answer(f"✅ Пользователь {target_id} удалён из ЧС.")
+
+    try:
+        await bot.send_message(target_id, "✅ Вы удалены из чёрного списка бота. Добро пожаловать обратно!")
+    except Exception:
+        pass
+
+
+@dp.message(F.text == "/admin_banlist")
+async def admin_banlist(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    cursor.execute("SELECT user_id FROM users WHERE blacklisted=1")
+    rows = cursor.fetchall()
+
+    if not rows:
+        await message.answer("✅ Чёрный список пуст.")
+        return
+
+    text = f"🚫 Чёрный список ({len(rows)} чел.):\n\n"
+    for row in rows:
+        text += f"• {row[0]}\n"
+
+    await message.answer(text)
+
+
 @dp.callback_query(F.data == "builds")
 async def builds(callback: CallbackQuery):
 
