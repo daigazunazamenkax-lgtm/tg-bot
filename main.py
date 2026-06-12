@@ -871,7 +871,8 @@ async def admin_amnesty_global(callback: CallbackQuery):
 async def admin_cancel(callback: CallbackQuery):
 
     user_states.pop(callback.from_user.id, None)
-    await callback.message.answer("Отмена")
+    await callback.message.delete()
+    await callback.answer("Отменено")
 
 
 @dp.callback_query(F.data == "admin_recommend")
