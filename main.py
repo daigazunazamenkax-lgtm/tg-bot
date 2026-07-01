@@ -636,6 +636,23 @@ async def admin_unban(message: Message):
 @dp.callback_query(F.data == "builds")
 async def builds(callback: CallbackQuery):
 
+    user_id = callback.from_user.id
+
+    # Проверяем ЧС
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT blacklisted FROM users WHERE user_id=?", (user_id,))
+        bl_row = lc.fetchone()
+
+    if bl_row and bl_row[0] == 1:
+        await callback.message.answer("❌ Вы в ЧС и не можете скачивать сборки. Обратитесь к администрации.")
+        return
+
+    # Проверяем подписку перед показом списка
+    if not await check_sub(user_id):
+        await callback.message.answer("❌ Подпишись на канал", reply_markup=sub_menu())
+        return
+
     async with db_lock:
         lc = db.cursor()
         lc.execute("SELECT * FROM builds")
@@ -1476,11 +1493,26 @@ async def run_web():
 
 
 async def notify_admins_on_start():
+    import datetime, time
+    stamp_file = "/tmp/bot_last_start.txt"
+    now_ts = time.time()
+    try:
+        with open(stamp_file) as f:
+            last = float(f.read().strip())
+        if now_ts - last < 10:
+            return  # Другой instance уже отправил уведомление
+    except Exception:
+        pass
+    try:
+        with open(stamp_file, "w") as f:
+            f.write(str(now_ts))
+    except Exception:
+        pass
     for admin_id in ADMINS:
         try:
             await bot.send_message(
                 admin_id,
-                "✅ Бот запущен и работает!\n🕐 " + __import__('datetime').datetime.now().strftime("%d.%m.%Y %H:%M:%S")
+                "✅ Бот запущен и работает!\n🕐 " + datetime.datetime.now().strftime("%d.%m.%Y %H:%M:%S")
             )
         except Exception:
             pass
@@ -1518,26 +1550,46 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
 
     user_id = event.new_chat_member.user.id
 
+    referrer_id = None
+    cnt = 0
+    was_banned = False
+
     async with db_lock:
-        cursor.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=1", (user_id,))
-        row = cursor.fetchone()
-        if not row:
-            return
+        lc = db.cursor()
 
-        referral_id, referrer_id = row
-        cursor.execute("UPDATE referrals SET confirmed=0 WHERE id=?", (referral_id,))
-        db.commit()
+        # Баним сразу если когда-либо скачивал — обходим Telegram-кэш
+        lc.execute("SELECT 1 FROM downloads WHERE user_id=? LIMIT 1", (user_id,))
+        had_downloads = lc.fetchone()
+        if had_downloads:
+            lc.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+            lc.execute("UPDATE users SET blacklisted=1 WHERE user_id=?", (user_id,))
+            db.commit()
+            was_banned = True
 
-        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
-        cnt = cursor.fetchone()[0]
+        # Аннулируем реферал если был
+        lc.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=1", (user_id,))
+        row = lc.fetchone()
+        if row:
+            referral_id, referrer_id = row
+            lc.execute("UPDATE referrals SET confirmed=0 WHERE id=?", (referral_id,))
+            db.commit()
+            lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+            cnt = lc.fetchone()[0]
 
-    try:
-        await bot.send_message(
-            referrer_id,
-            f"❌ Ваш реферал отписался от канала — реферал аннулирован.\nПодтверждённых: {cnt}/5"
-        )
-    except Exception:
-        pass
+    if was_banned:
+        try:
+            await bot.send_message(user_id, "❌ Вы отписались от канала и добавлены в чёрный список бота.")
+        except Exception:
+            pass
+
+    if referrer_id:
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"❌ Ваш реферал отписался от канала — реферал аннулирован.\nПодтверждённых: {cnt}/5"
+            )
+        except Exception:
+            pass
 
 
 async def main():
