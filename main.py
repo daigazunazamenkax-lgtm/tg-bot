@@ -312,8 +312,12 @@ async def confirm_referral_if_pending(user_id):
 
         referral_id, referrer_id = pending
 
-        lc.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
+        lc.execute("UPDATE referrals SET confirmed=1 WHERE id=? AND confirmed=0", (referral_id,))
         db.commit()
+
+        if lc.rowcount == 0:
+            # Другой процесс/инстанс бота уже подтвердил этот реферал — не дублируем уведомление
+            return
 
         lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
         cnt = lc.fetchone()[0]
