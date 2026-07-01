@@ -304,29 +304,30 @@ def build_sponsor_keyboard(unmet_channels, unmet_links, build_id):
 async def confirm_referral_if_pending(user_id):
 
     async with db_lock:
-        cursor.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=0", (user_id,))
-        pending = cursor.fetchone()
+        lc = db.cursor()
+        lc.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=0", (user_id,))
+        pending = lc.fetchone()
         if not pending:
             return
 
         referral_id, referrer_id = pending
 
-        cursor.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
+        lc.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
         db.commit()
 
-        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
-        cnt = cursor.fetchone()[0]
+        lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+        cnt = lc.fetchone()[0]
 
         reward_to_send = None
         if cnt >= 5:
-            cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
-            reward_row = cursor.fetchone()
+            lc.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+            reward_row = lc.fetchone()
             if reward_row:
-                cursor.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
-                already = cursor.fetchone()
+                lc.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
+                already = lc.fetchone()
                 if not already:
                     reward_to_send = reward_row
-                    cursor.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
+                    lc.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
                     db.commit()
 
     # Все await — за пределами лока, курсор уже не нужен
@@ -430,8 +431,10 @@ async def show_users(message: Message):
     if message.from_user.id not in ADMINS:
         return
 
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT user_id FROM users")
+        users = lc.fetchall()
 
     if not users:
         await message.answer("👤 Пользователей пока нет.")
@@ -463,37 +466,40 @@ async def admin_unref(message: Message):
         await message.answer("❌ Неверный user_id — должно быть число")
         return
 
+    no_pending_msg = None
+    referrer_id = None
+    cnt = 0
+    reward_to_send = None
+
     async with db_lock:
-        cursor.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=0", (target_id,))
-        pending = cursor.fetchone()
+        lc = db.cursor()
+        lc.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=0", (target_id,))
+        pending = lc.fetchone()
 
         if not pending:
-            cursor.execute("SELECT 1 FROM referrals WHERE referred_id=?", (target_id,))
-            exists = cursor.fetchone()
-            if exists:
-                await message.answer(f"ℹ️ Реферал {target_id} уже подтверждён ранее")
-            else:
-                await message.answer(f"❌ Реферал {target_id} не найден в базе")
-            return
+            lc.execute("SELECT 1 FROM referrals WHERE referred_id=?", (target_id,))
+            exists = lc.fetchone()
+            no_pending_msg = f"ℹ️ Реферал {target_id} уже подтверждён ранее" if exists else f"❌ Реферал {target_id} не найден в базе"
+        else:
+            referral_id, referrer_id = pending
+            lc.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
+            db.commit()
+            lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+            cnt = lc.fetchone()[0]
+            if cnt >= 5:
+                lc.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+                reward_row = lc.fetchone()
+                if reward_row:
+                    lc.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
+                    already = lc.fetchone()
+                    if not already:
+                        reward_to_send = reward_row
+                        lc.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
+                        db.commit()
 
-        referral_id, referrer_id = pending
-        cursor.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
-        db.commit()
-
-        cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
-        cnt = cursor.fetchone()[0]
-
-        reward_to_send = None
-        if cnt >= 5:
-            cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
-            reward_row = cursor.fetchone()
-            if reward_row:
-                cursor.execute("SELECT 1 FROM reward_issued WHERE user_id=? AND reward_id=?", (referrer_id, reward_row[0]))
-                already = cursor.fetchone()
-                if not already:
-                    reward_to_send = reward_row
-                    cursor.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
-                    db.commit()
+    if no_pending_msg:
+        await message.answer(no_pending_msg)
+        return
 
     await message.answer(f"✅ Реферал {target_id} вручную подтверждён. Реферер уведомлён.")
 
@@ -514,21 +520,22 @@ async def show_refs(message: Message):
     if message.from_user.id not in ADMINS:
         return
 
-    cursor.execute("""
-        SELECT r.referrer_id, r.referred_id, r.confirmed, r.ts
-        FROM referrals r
-        ORDER BY r.ts DESC
-    """)
-    rows = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("""
+            SELECT r.referrer_id, r.referred_id, r.confirmed, r.ts
+            FROM referrals r
+            ORDER BY r.ts DESC
+        """)
+        rows = lc.fetchall()
+        lc.execute("SELECT COUNT(*) FROM referrals WHERE confirmed=1")
+        total_confirmed = lc.fetchone()[0]
+        lc.execute("SELECT COUNT(*) FROM referrals WHERE confirmed=0")
+        total_pending = lc.fetchone()[0]
 
     if not rows:
         await message.answer("📭 Рефералов пока нет.")
         return
-
-    cursor.execute("SELECT COUNT(*) FROM referrals WHERE confirmed=1")
-    total_confirmed = cursor.fetchone()[0]
-    cursor.execute("SELECT COUNT(*) FROM referrals WHERE confirmed=0")
-    total_pending = cursor.fetchone()[0]
 
     text = f"👥 Рефералы: всего {len(rows)} | ✅ подтверждено {total_confirmed} | ⏳ ожидает {total_pending}\n\n"
 
@@ -548,8 +555,10 @@ async def admin_banlist(message: Message):
     if message.from_user.id not in ADMINS:
         return
 
-    cursor.execute("SELECT user_id FROM users WHERE blacklisted=1")
-    rows = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT user_id FROM users WHERE blacklisted=1")
+        rows = lc.fetchall()
 
     if not rows:
         await message.answer("✅ Чёрный список пуст.")
@@ -600,16 +609,21 @@ async def admin_unban(message: Message):
     target_id = int(parts[1].strip())
 
     async with db_lock:
-        cursor.execute("SELECT blacklisted FROM users WHERE user_id=?", (target_id,))
-        row = cursor.fetchone()
-        if not row:
-            await message.answer(f"⚠️ Пользователь {target_id} не найден в базе.")
-            return
-        if row[0] != 1:
-            await message.answer(f"⚠️ Пользователь {target_id} не в ЧС.")
-            return
-        cursor.execute("UPDATE users SET blacklisted=0 WHERE user_id=?", (target_id,))
-        db.commit()
+        lc = db.cursor()
+        lc.execute("SELECT blacklisted FROM users WHERE user_id=?", (target_id,))
+        row = lc.fetchone()
+        not_found = row is None
+        not_banned = row is not None and row[0] != 1
+        if not not_found and not not_banned:
+            lc.execute("UPDATE users SET blacklisted=0 WHERE user_id=?", (target_id,))
+            db.commit()
+
+    if not_found:
+        await message.answer(f"⚠️ Пользователь {target_id} не найден в базе.")
+        return
+    if not_banned:
+        await message.answer(f"⚠️ Пользователь {target_id} не в ЧС.")
+        return
 
     await message.answer(f"✅ Пользователь {target_id} удалён из ЧС.")
 
@@ -622,9 +636,12 @@ async def admin_unban(message: Message):
 @dp.callback_query(F.data == "builds")
 async def builds(callback: CallbackQuery):
 
-    cursor.execute("SELECT * FROM builds")
-
-    builds_list = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT * FROM builds")
+        builds_list = lc.fetchall()
+        lc.execute("SELECT * FROM builds WHERE recommended=1 LIMIT 1")
+        recommended_build = lc.fetchone()
 
     if not builds_list:
 
@@ -635,9 +652,6 @@ async def builds(callback: CallbackQuery):
         return
 
     kb = InlineKeyboardBuilder()
-
-    cursor.execute("SELECT * FROM builds WHERE recommended=1 LIMIT 1")
-    recommended_build = cursor.fetchone()
 
     for build in builds_list:
 
@@ -666,46 +680,51 @@ async def build(callback: CallbackQuery):
     build_id = int(
         callback.data.split("_")[1]
     )
+    user_id = callback.from_user.id
 
-    cursor.execute("SELECT blacklisted FROM users WHERE user_id=?", (callback.from_user.id,))
-    row = cursor.fetchone()
-    if row and row[0] == 1:
+    # 1. Читаем статус ЧС до любых await
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT blacklisted FROM users WHERE user_id=?", (user_id,))
+        bl_row = lc.fetchone()
+
+    if bl_row and bl_row[0] == 1:
         await callback.message.answer(
             "❌ Вы в ЧС и не можете скачивать сборки. Обратитесь к администрации."
         )
         return
 
-    is_subscribed = await check_sub(
-        callback.from_user.id
-    )
+    # 2. Проверяем подписку (await)
+    is_subscribed = await check_sub(user_id)
 
     if is_subscribed:
-        await confirm_referral_if_pending(callback.from_user.id)
+        await confirm_referral_if_pending(user_id)
 
     if not is_subscribed:
-
-        cursor.execute("SELECT 1 FROM downloads WHERE user_id=? LIMIT 1", (callback.from_user.id,))
-        had = cursor.fetchone()
+        # 3. Читаем историю загрузок после await — нужен свежий лок
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute("SELECT 1 FROM downloads WHERE user_id=? LIMIT 1", (user_id,))
+            had = lc.fetchone()
+            if had:
+                lc.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
+                lc.execute("UPDATE users SET blacklisted=1 WHERE user_id=?", (user_id,))
+                db.commit()
 
         if had:
-            cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (callback.from_user.id,))
-            cursor.execute("UPDATE users SET blacklisted=1 WHERE user_id=?", (callback.from_user.id,))
-            db.commit()
-
             await callback.message.answer(
                 "❌ Вы отписались от канала после получения сборки — вы добавлены в ЧС."
             )
-
             return
 
         await callback.message.answer(
             "❌ Подпишись на канал",
             reply_markup=sub_menu()
         )
-
         return
 
-    unmet_channels, unmet_links = await get_unmet_sponsors(callback.from_user.id)
+    # 4. Проверяем спонсоров (await)
+    unmet_channels, unmet_links = await get_unmet_sponsors(user_id)
     if unmet_channels or unmet_links:
         await callback.message.answer(
             "📋 Для получения сборки подпишись на всех спонсоров:",
@@ -713,29 +732,22 @@ async def build(callback: CallbackQuery):
         )
         return
 
-    cursor.execute(
-        "SELECT * FROM builds WHERE id=?",
-        (build_id,)
-    )
-
-    build_row = cursor.fetchone()
+    # 5. Читаем и обновляем сборку — всё в одном локе
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT * FROM builds WHERE id=?", (build_id,))
+        build_row = lc.fetchone()
+        if build_row:
+            lc.execute("UPDATE builds SET downloads = downloads + 1 WHERE id=?", (build_id,))
+            try:
+                lc.execute("INSERT INTO downloads (user_id, build_id) VALUES (?, ?)", (user_id, build_id))
+            except Exception:
+                pass
+            db.commit()
 
     if not build_row:
         await callback.message.answer("❌ Сборка не найдена.")
         return
-
-    cursor.execute(
-        "UPDATE builds SET downloads = downloads + 1 WHERE id=?",
-        (build_id,)
-    )
-
-    db.commit()
-
-    try:
-        cursor.execute("INSERT INTO downloads (user_id, build_id) VALUES (?, ?)", (callback.from_user.id, build_id))
-        db.commit()
-    except Exception:
-        pass
 
     text = f"""
 🔥 {build_row[1]}
@@ -787,28 +799,27 @@ async def check_sponsor_sub(callback: CallbackQuery):
         await callback.answer(f"❌ Ещё не подписан: {names}", show_alert=True)
         return
 
-    for sponsor in unmet_links:
-        sid = sponsor[0]
-        cursor.execute("INSERT OR IGNORE INTO sponsor_acks (user_id, sponsor_id) VALUES (?, ?)", (user_id, sid))
-    db.commit()
+    # Записываем acks и читаем сборку под локом
+    async with db_lock:
+        lc = db.cursor()
+        for sponsor in unmet_links:
+            sid = sponsor[0]
+            lc.execute("INSERT OR IGNORE INTO sponsor_acks (user_id, sponsor_id) VALUES (?, ?)", (user_id, sid))
+        lc.execute("SELECT * FROM builds WHERE id=?", (build_id,))
+        build_row = lc.fetchone()
+        if build_row:
+            lc.execute("UPDATE builds SET downloads = downloads + 1 WHERE id=?", (build_id,))
+            try:
+                lc.execute("INSERT INTO downloads (user_id, build_id) VALUES (?, ?)", (user_id, build_id))
+            except Exception:
+                pass
+        db.commit()
 
     await callback.message.delete()
-
-    cursor.execute("SELECT * FROM builds WHERE id=?", (build_id,))
-    build_row = cursor.fetchone()
 
     if not build_row:
         await callback.message.answer("❌ Сборка не найдена.")
         return
-
-    cursor.execute("UPDATE builds SET downloads = downloads + 1 WHERE id=?", (build_id,))
-    db.commit()
-
-    try:
-        cursor.execute("INSERT INTO downloads (user_id, build_id) VALUES (?, ?)", (user_id, build_id))
-        db.commit()
-    except Exception:
-        pass
 
     text = f"🔥 {build_row[1]}\n\n📥 Скачать:\n{build_row[2]}"
     kb = InlineKeyboardBuilder()
@@ -876,8 +887,10 @@ async def admin_del_sponsor_pick(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
 
-    cursor.execute("SELECT id, type, name FROM sponsors WHERE active=1 ORDER BY id")
-    rows = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, type, name FROM sponsors WHERE active=1 ORDER BY id")
+        rows = lc.fetchall()
 
     if not rows:
         await callback.answer("Нет активных спонсоров.", show_alert=True)
@@ -904,9 +917,11 @@ async def admin_del_sponsor(callback: CallbackQuery):
     except ValueError:
         return
 
-    cursor.execute("DELETE FROM sponsors WHERE id=?", (sid,))
-    cursor.execute("DELETE FROM sponsor_acks WHERE sponsor_id=?", (sid,))
-    db.commit()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("DELETE FROM sponsors WHERE id=?", (sid,))
+        lc.execute("DELETE FROM sponsor_acks WHERE sponsor_id=?", (sid,))
+        db.commit()
 
     await callback.message.delete()
     await callback.answer("✅ Спонсор удалён", show_alert=True)
@@ -953,9 +968,10 @@ async def admin_delete(callback: CallbackQuery):
 
     user_states[callback.from_user.id] = "delete"
 
-    cursor.execute("SELECT * FROM builds")
-
-    builds_list = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT * FROM builds")
+        builds_list = lc.fetchall()
 
     text = "🗑 Сборки:\n\n"
 
@@ -1012,8 +1028,10 @@ async def admin_reward(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
 
-    cursor.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
-    row = cursor.fetchone()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+        row = lc.fetchone()
 
     if row:
         text = (
@@ -1042,9 +1060,10 @@ async def admin_amnesty(callback: CallbackQuery):
 
     user_states[callback.from_user.id] = "amnesty"
 
-    cursor.execute("SELECT user_id FROM users WHERE blacklisted=1")
-
-    rows = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT user_id FROM users WHERE blacklisted=1")
+        rows = lc.fetchall()
 
     if not rows:
         await callback.message.answer("ЧС пуст")
@@ -1072,8 +1091,10 @@ async def admin_amnesty_global(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
 
-    cursor.execute("UPDATE users SET blacklisted=0 WHERE blacklisted=1")
-    db.commit()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("UPDATE users SET blacklisted=0 WHERE blacklisted=1")
+        db.commit()
 
     await callback.message.answer("✅ Глобальная амнистия выполнена — все сняты с ЧС")
 
@@ -1094,9 +1115,10 @@ async def admin_recommend(callback: CallbackQuery):
 
     user_states[callback.from_user.id] = "recommend"
 
-    cursor.execute("SELECT * FROM builds")
-
-    builds_list = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT * FROM builds")
+        builds_list = lc.fetchall()
 
     text = "⭐ Сборки:\n\n"
 
@@ -1116,8 +1138,14 @@ async def referral_panel(callback: CallbackQuery):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{user_id}"
 
-    cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
-    cnt = cursor.fetchone()[0]
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
+        cnt = lc.fetchone()[0]
+        reward = None
+        if cnt >= 5:
+            lc.execute("SELECT title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+            reward = lc.fetchone()
 
     text = (
         "🤝 Партнёрская программа:\n\n"
@@ -1129,8 +1157,6 @@ async def referral_panel(callback: CallbackQuery):
     if cnt < 5:
         text += f"Подтверждённых рефералов: {cnt}/5"
     else:
-        cursor.execute("SELECT title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
-        reward = cursor.fetchone()
         if reward:
             text += (
                 f"Подтверждённых рефералов: {cnt}/5\n\n"
@@ -1156,8 +1182,10 @@ async def ref_command(message: Message):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{user_id}"
 
-    cursor.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
-    cnt = cursor.fetchone()[0]
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
+        cnt = lc.fetchone()[0]
 
     text = (
         "🤝 Партнёрская программа:\n\n"
@@ -1192,12 +1220,13 @@ async def handle_text(message: Message):
             name = data[0].strip()
             link = data[1].strip()
 
-            cursor.execute(
-                "INSERT INTO builds (name, link) VALUES (?, ?)",
-                (name, link)
-            )
-
-            db.commit()
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute(
+                    "INSERT INTO builds (name, link) VALUES (?, ?)",
+                    (name, link)
+                )
+                db.commit()
 
             user_states.pop(user_id, None)
 
@@ -1221,12 +1250,10 @@ async def handle_text(message: Message):
 
             build_id = int(message.text)
 
-            cursor.execute(
-                "DELETE FROM builds WHERE id=?",
-                (build_id,)
-            )
-
-            db.commit()
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute("DELETE FROM builds WHERE id=?", (build_id,))
+                db.commit()
 
             user_states.pop(user_id, None)
 
@@ -1250,13 +1277,11 @@ async def handle_text(message: Message):
 
             build_id = int(message.text)
 
-            cursor.execute("UPDATE builds SET recommended=0")
-            cursor.execute(
-                "UPDATE builds SET recommended=1 WHERE id=?",
-                (build_id,)
-            )
-
-            db.commit()
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute("UPDATE builds SET recommended=0")
+                lc.execute("UPDATE builds SET recommended=1 WHERE id=?", (build_id,))
+                db.commit()
 
             user_states.pop(user_id, None)
 
@@ -1276,9 +1301,10 @@ async def handle_text(message: Message):
 
     elif state == "broadcast":
 
-        cursor.execute("SELECT user_id FROM users")
-
-        users = cursor.fetchall()
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute("SELECT user_id FROM users")
+            users = lc.fetchall()
 
         success = 0
 
@@ -1317,9 +1343,11 @@ async def handle_text(message: Message):
             yt = data[1].strip()
             link = data[2].strip()
 
-            cursor.execute("UPDATE rewards SET active=0 WHERE active=1")
-            cursor.execute("INSERT INTO rewards (title, youtube_link, download_link, active) VALUES (?, ?, ?, 1)", (title, yt, link))
-            db.commit()
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute("UPDATE rewards SET active=0 WHERE active=1")
+                lc.execute("INSERT INTO rewards (title, youtube_link, download_link, active) VALUES (?, ?, ?, 1)", (title, yt, link))
+                db.commit()
 
             user_states.pop(user_id, None)
 
@@ -1338,12 +1366,10 @@ async def handle_text(message: Message):
 
             target_id = int(message.text)
 
-            cursor.execute(
-                "UPDATE users SET blacklisted=0 WHERE user_id=?",
-                (target_id,)
-            )
-
-            db.commit()
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute("UPDATE users SET blacklisted=0 WHERE user_id=?", (target_id,))
+                db.commit()
 
             user_states.pop(user_id, None)
 
