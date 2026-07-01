@@ -261,8 +261,13 @@ async def check_sub(user_id):
 
 
 async def get_unmet_sponsors(user_id):
-    cursor.execute("SELECT id, type, target, button_text, name FROM sponsors WHERE active=1")
-    all_sponsors = cursor.fetchall()
+    lc = db.cursor()
+    lc.execute("SELECT id, type, target, button_text, name FROM sponsors WHERE active=1")
+    all_sponsors = lc.fetchall()
+
+    lc2 = db.cursor()
+    lc2.execute("SELECT sponsor_id FROM sponsor_acks WHERE user_id=?", (user_id,))
+    acked_ids = {row[0] for row in lc2.fetchall()}
 
     unmet_channels = []
     unmet_links = []
@@ -277,8 +282,7 @@ async def get_unmet_sponsors(user_id):
             except Exception:
                 unmet_channels.append(sponsor)
         elif stype == "link":
-            cursor.execute("SELECT 1 FROM sponsor_acks WHERE user_id=? AND sponsor_id=?", (user_id, sid))
-            if not cursor.fetchone():
+            if sid not in acked_ids:
                 unmet_links.append(sponsor)
 
     return unmet_channels, unmet_links
@@ -967,12 +971,12 @@ async def admin_stats(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
 
-    cursor.execute("SELECT * FROM builds")
-
-    builds_list = cursor.fetchall()
-
-    cursor.execute("SELECT COUNT(*) FROM users")
-    total_users = cursor.fetchone()[0]
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT * FROM builds")
+        builds_list = lc.fetchall()
+        lc.execute("SELECT COUNT(*) FROM users")
+        total_users = lc.fetchone()[0]
 
     text = f"📊 Статистика\n\nПользователей: {total_users}\n\n"
 
