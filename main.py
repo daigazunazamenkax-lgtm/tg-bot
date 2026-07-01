@@ -296,7 +296,7 @@ def build_sponsor_keyboard(unmet_channels, unmet_links, build_id):
     for sponsor in unmet_links:
         sid, stype, target, button_text, name = sponsor
         kb.button(text=f"🔗 {button_text}", url=target)
-    kb.button(text="✅ Я подписался — проверить", callback_data=f"check_sponsor_sub_{build_id}")
+    kb.button(text="✅ Я подписался - проверить", callback_data=f"check_sponsor_sub_{build_id}")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -316,7 +316,7 @@ async def confirm_referral_if_pending(user_id):
         db.commit()
 
         if lc.rowcount == 0:
-            # Другой процесс/инстанс бота уже подтвердил этот реферал — не дублируем уведомление
+            # Другой процесс/инстанс бота уже подтвердил этот реферал - не дублируем уведомление
             return
 
         lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
@@ -334,7 +334,7 @@ async def confirm_referral_if_pending(user_id):
                     lc.execute("INSERT INTO reward_issued (user_id, reward_id) VALUES (?, ?)", (referrer_id, reward_row[0]))
                     db.commit()
 
-    # Все await — за пределами лока, курсор уже не нужен
+    # Все await - за пределами лока, курсор уже не нужен
     try:
         chat = await bot.get_chat(user_id)
         name = chat.username or chat.first_name or str(user_id)
@@ -360,7 +360,7 @@ async def start(message: Message):
     param = parts[1].strip() if len(parts) > 1 else None
 
     async with db_lock:
-        # Проверяем — новый пользователь или уже был в боте
+        # Проверяем - новый пользователь или уже был в боте
         cursor.execute("SELECT user_id FROM users WHERE user_id=?", (message.from_user.id,))
         is_new_user = cursor.fetchone() is None
 
@@ -398,7 +398,7 @@ async def start(message: Message):
                 cursor.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id) VALUES (?, ?)", (referrer_id, message.from_user.id))
                 db.commit()
 
-    # await — за пределами лока
+    # await - за пределами лока
     if param and is_new_user and referrer_id and referrer_id != message.from_user.id:
         try:
             if await check_sub(message.from_user.id):
@@ -467,7 +467,7 @@ async def admin_unref(message: Message):
     try:
         target_id = int(parts[1].strip())
     except ValueError:
-        await message.answer("❌ Неверный user_id — должно быть число")
+        await message.answer("❌ Неверный user_id - должно быть число")
         return
 
     no_pending_msg = None
@@ -745,7 +745,7 @@ async def build(callback: CallbackQuery):
         )
         return
 
-    # 5. Читаем и обновляем сборку — всё в одном локе
+    # 5. Читаем и обновляем сборку - всё в одном локе
     async with db_lock:
         lc = db.cursor()
         lc.execute("SELECT * FROM builds WHERE id=?", (build_id,))
@@ -857,7 +857,7 @@ async def admin_sponsors(callback: CallbackQuery):
             sid, stype, name, button_text, active = row
             icon = "📢" if stype == "channel" else "🔗"
             status = "✅" if active else "❌"
-            text += f"{status} [{sid}] {icon} {name} — «{button_text}»\n"
+            text += f"{status} [{sid}] {icon} {name} - «{button_text}»\n"
     else:
         text += "Спонсоров пока нет.\n"
 
@@ -1015,7 +1015,7 @@ async def admin_stats(callback: CallbackQuery):
 
         text += (
             f"{b[0]} | "
-            f"{b[1]} — "
+            f"{b[1]} - "
             f"{b[3]} скачиваний\n"
         )
 
@@ -1032,8 +1032,8 @@ async def admin_broadcast(callback: CallbackQuery):
 
     await callback.message.answer(
         "📢 Отправь текст рассылки\n\n"
-        "Можно с форматированием (жирный, ссылки и т.д.) — сохранится.\n"
-        "Можно отправить фото с подписью — разошлю с картинкой."
+        "Можно с форматированием (жирный, ссылки и т.д.) - сохранится.\n"
+        "Можно отправить фото с подписью - разошлю с картинкой."
     )
 
 
@@ -1054,12 +1054,12 @@ async def admin_reward(callback: CallbackQuery):
             f"{row[1]}\n"
             f"YouTube: {row[2]}\n"
             f"Ссылка: {row[3]}\n\n"
-            "Чтобы установить новую — отправьте сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
+            "Чтобы установить новую - отправьте сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
         )
     else:
         text = (
             "Награда не задана.\n"
-            "Чтобы установить — отправьте сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
+            "Чтобы установить - отправьте сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
         )
 
     user_states[callback.from_user.id] = "set_reward"
@@ -1111,7 +1111,7 @@ async def admin_amnesty_global(callback: CallbackQuery):
         lc.execute("UPDATE users SET blacklisted=0 WHERE blacklisted=1")
         db.commit()
 
-    await callback.message.answer("✅ Глобальная амнистия выполнена — все сняты с ЧС")
+    await callback.message.answer("✅ Глобальная амнистия выполнена - все сняты с ЧС")
 
 
 @dp.callback_query(F.data == "admin_cancel")
@@ -1568,7 +1568,7 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
     async with db_lock:
         lc = db.cursor()
 
-        # Баним сразу если когда-либо скачивал — обходим Telegram-кэш
+        # Баним сразу если когда-либо скачивал - обходим Telegram-кэш
         lc.execute("SELECT 1 FROM downloads WHERE user_id=? LIMIT 1", (user_id,))
         had_downloads = lc.fetchone()
         if had_downloads:
@@ -1601,7 +1601,7 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
         try:
             await bot.send_message(
                 referrer_id,
-                f"❌ Ваш реферал отписался от канала — реферал аннулирован.\nПодтверждённых: {cnt}/5"
+                f"❌ Ваш реферал отписался от канала - реферал аннулирован.\nПодтверждённых: {cnt}/5"
             )
         except Exception:
             pass
