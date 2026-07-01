@@ -307,7 +307,7 @@ def build_sponsor_keyboard(unmet_channels, unmet_links, build_id):
             channel_url = f"https://t.me/{target.lstrip('@')}"
         kb.button(text=f"📢 {button_text}", url=channel_url)
     for sponsor in unmet_links:
-        sid, stype, target, button_text, name = sponsor
+        sid, stype, target, button_text, name, _ = sponsor
         kb.button(text=f"🔗 {button_text}", url=target)
     kb.button(text="✅ Я подписался - проверить", callback_data=f"check_sponsor_sub_{build_id}")
     kb.adjust(1)
