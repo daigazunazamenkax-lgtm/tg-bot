@@ -486,10 +486,14 @@ async def admin_unref(message: Message):
             no_pending_msg = f"ℹ️ Реферал {target_id} уже подтверждён ранее" if exists else f"❌ Реферал {target_id} не найден в базе"
         else:
             referral_id, referrer_id = pending
-            lc.execute("UPDATE referrals SET confirmed=1 WHERE id=?", (referral_id,))
+            lc.execute("UPDATE referrals SET confirmed=1 WHERE id=? AND confirmed=0", (referral_id,))
             db.commit()
-            lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
-            cnt = lc.fetchone()[0]
+            if lc.rowcount == 0:
+                no_pending_msg = f"ℹ️ Реферал {target_id} уже подтверждён ранее"
+                referrer_id = None
+            else:
+                lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+                cnt = lc.fetchone()[0]
             if cnt >= 5:
                 lc.execute("SELECT id, title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
                 reward_row = lc.fetchone()
