@@ -25,6 +25,7 @@ bot = Bot(TOKEN)
 dp = Dispatcher()
 
 user_states = {}
+user_temp = {}
 db_lock = asyncio.Lock()
 
 DB_PATH = os.environ.get("DB_PATH", "bot/bot.db")
@@ -110,6 +111,25 @@ CREATE TABLE IF NOT EXISTS reward_issued (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS sponsors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type TEXT NOT NULL,
+    target TEXT NOT NULL,
+    button_text TEXT NOT NULL,
+    name TEXT NOT NULL,
+    active INTEGER DEFAULT 1
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS sponsor_acks (
+    user_id INTEGER,
+    sponsor_id INTEGER,
+    PRIMARY KEY (user_id, sponsor_id)
+)
+""")
+
 db.commit()
 
 
@@ -187,6 +207,11 @@ def admin_menu():
         callback_data="admin_amnesty"
     )
 
+    kb.button(
+        text="👥 Спонсоры",
+        callback_data="admin_sponsors"
+    )
+
     kb.adjust(1)
 
     return kb.as_markup()
@@ -233,6 +258,43 @@ async def check_sub(user_id):
 
     except:
         return False
+
+
+async def get_unmet_sponsors(user_id):
+    cursor.execute("SELECT id, type, target, button_text, name FROM sponsors WHERE active=1")
+    all_sponsors = cursor.fetchall()
+
+    unmet_channels = []
+    unmet_links = []
+
+    for sponsor in all_sponsors:
+        sid, stype, target, button_text, name = sponsor
+        if stype == "channel":
+            try:
+                member = await bot.get_chat_member(int(target), user_id)
+                if member.status not in ["member", "administrator", "creator"]:
+                    unmet_channels.append(sponsor)
+            except Exception:
+                unmet_channels.append(sponsor)
+        elif stype == "link":
+            cursor.execute("SELECT 1 FROM sponsor_acks WHERE user_id=? AND sponsor_id=?", (user_id, sid))
+            if not cursor.fetchone():
+                unmet_links.append(sponsor)
+
+    return unmet_channels, unmet_links
+
+
+def build_sponsor_keyboard(unmet_channels, unmet_links, build_id):
+    kb = InlineKeyboardBuilder()
+    for sponsor in unmet_channels:
+        sid, stype, target, button_text, name = sponsor
+        kb.button(text=f"📢 {button_text}", url=f"https://t.me/{target.lstrip('@')}" if not target.startswith("http") else target)
+    for sponsor in unmet_links:
+        sid, stype, target, button_text, name = sponsor
+        kb.button(text=f"🔗 {button_text}", url=target)
+    kb.button(text="✅ Я подписался — проверить", callback_data=f"check_sponsor_sub_{build_id}")
+    kb.adjust(1)
+    return kb.as_markup()
 
 
 async def confirm_referral_if_pending(user_id):
@@ -639,6 +701,14 @@ async def build(callback: CallbackQuery):
 
         return
 
+    unmet_channels, unmet_links = await get_unmet_sponsors(callback.from_user.id)
+    if unmet_channels or unmet_links:
+        await callback.message.answer(
+            "📋 Для получения сборки подпишись на всех спонсоров:",
+            reply_markup=build_sponsor_keyboard(unmet_channels, unmet_links, build_id)
+        )
+        return
+
     cursor.execute(
         "SELECT * FROM builds WHERE id=?",
         (build_id,)
@@ -699,6 +769,141 @@ async def check(callback: CallbackQuery):
             "❌ Ты не подписан",
             show_alert=True
         )
+
+
+@dp.callback_query(F.data.startswith("check_sponsor_sub_"))
+async def check_sponsor_sub(callback: CallbackQuery):
+    build_id = int(callback.data.split("_")[-1])
+    user_id = callback.from_user.id
+
+    unmet_channels, unmet_links = await get_unmet_sponsors(user_id)
+
+    if unmet_channels:
+        names = ", ".join(s[4] for s in unmet_channels)
+        await callback.answer(f"❌ Ещё не подписан: {names}", show_alert=True)
+        return
+
+    for sponsor in unmet_links:
+        sid = sponsor[0]
+        cursor.execute("INSERT OR IGNORE INTO sponsor_acks (user_id, sponsor_id) VALUES (?, ?)", (user_id, sid))
+    db.commit()
+
+    await callback.message.delete()
+
+    cursor.execute("SELECT * FROM builds WHERE id=?", (build_id,))
+    build_row = cursor.fetchone()
+
+    if not build_row:
+        await callback.message.answer("❌ Сборка не найдена.")
+        return
+
+    cursor.execute("UPDATE builds SET downloads = downloads + 1 WHERE id=?", (build_id,))
+    db.commit()
+
+    try:
+        cursor.execute("INSERT INTO downloads (user_id, build_id) VALUES (?, ?)", (user_id, build_id))
+        db.commit()
+    except Exception:
+        pass
+
+    text = f"🔥 {build_row[1]}\n\n📥 Скачать:\n{build_row[2]}"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "admin_sponsors")
+async def admin_sponsors(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    cursor.execute("SELECT id, type, name, button_text, active FROM sponsors ORDER BY id")
+    rows = cursor.fetchall()
+
+    text = "👥 Спонсоры\n\n"
+    if rows:
+        for row in rows:
+            sid, stype, name, button_text, active = row
+            icon = "📢" if stype == "channel" else "🔗"
+            status = "✅" if active else "❌"
+            text += f"{status} [{sid}] {icon} {name} — «{button_text}»\n"
+    else:
+        text += "Спонсоров пока нет.\n"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить канал", callback_data="admin_add_sponsor_channel")
+    kb.button(text="➕ Добавить ссылку", callback_data="admin_add_sponsor_link")
+    if rows:
+        kb.button(text="🗑 Удалить спонсора", callback_data="admin_del_sponsor_pick")
+    kb.button(text="🔙 Назад", callback_data="admin_panel")
+    kb.adjust(1)
+
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "admin_add_sponsor_channel")
+async def admin_add_sponsor_channel(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+    user_states[callback.from_user.id] = "sponsor_channel_id"
+    user_temp[callback.from_user.id] = {}
+    await callback.message.answer(
+        "📢 Введи ID канала (число, например -1001234567890)\n\n"
+        "Бот должен быть добавлен в этот канал как участник или админ."
+    )
+
+
+@dp.callback_query(F.data == "admin_add_sponsor_link")
+async def admin_add_sponsor_link(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+    user_states[callback.from_user.id] = "sponsor_link_url"
+    user_temp[callback.from_user.id] = {}
+    await callback.message.answer(
+        "🔗 Введи ссылку (например https://t.me/SomeBot?start=ref123)"
+    )
+
+
+@dp.callback_query(F.data == "admin_del_sponsor_pick")
+async def admin_del_sponsor_pick(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    cursor.execute("SELECT id, type, name FROM sponsors WHERE active=1 ORDER BY id")
+    rows = cursor.fetchall()
+
+    if not rows:
+        await callback.answer("Нет активных спонсоров.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    for row in rows:
+        sid, stype, name = row
+        icon = "📢" if stype == "channel" else "🔗"
+        kb.button(text=f"🗑 {icon} {name}", callback_data=f"admin_del_sponsor_{sid}")
+    kb.button(text="🔙 Назад", callback_data="admin_sponsors")
+    kb.adjust(1)
+
+    await callback.message.answer("Выбери спонсора для удаления:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.startswith("admin_del_sponsor_"))
+async def admin_del_sponsor(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        sid = int(callback.data.split("_")[-1])
+    except ValueError:
+        return
+
+    cursor.execute("DELETE FROM sponsors WHERE id=?", (sid,))
+    cursor.execute("DELETE FROM sponsor_acks WHERE sponsor_id=?", (sid,))
+    db.commit()
+
+    await callback.message.delete()
+    await callback.answer("✅ Спонсор удалён", show_alert=True)
 
 
 @dp.callback_query(F.data == "main_menu")
@@ -1151,6 +1356,68 @@ async def handle_text(message: Message):
             )
 
             return
+
+    elif state == "sponsor_channel_id":
+        try:
+            channel_id = int(message.text.strip())
+            user_temp[user_id]["channel_id"] = channel_id
+            user_states[user_id] = "sponsor_channel_text"
+            await message.answer("✏️ Введи текст кнопки (например: Подписаться на канал)")
+        except ValueError:
+            await message.answer("❌ ID должен быть числом, например -1001234567890")
+        return
+
+    elif state == "sponsor_channel_text":
+        user_temp[user_id]["button_text"] = message.text.strip()
+        user_states[user_id] = "sponsor_channel_name"
+        await message.answer("📝 Введи название для admin-панели (например: МойКанал)")
+        return
+
+    elif state == "sponsor_channel_name":
+        data = user_temp.get(user_id, {})
+        name = message.text.strip()
+        channel_id = data.get("channel_id")
+        button_text = data.get("button_text")
+        cursor.execute(
+            "INSERT INTO sponsors (type, target, button_text, name) VALUES (?, ?, ?, ?)",
+            ("channel", str(channel_id), button_text, name)
+        )
+        db.commit()
+        user_states.pop(user_id, None)
+        user_temp.pop(user_id, None)
+        await message.answer(f"✅ Спонсор-канал «{name}» добавлен!")
+        return
+
+    elif state == "sponsor_link_url":
+        url = message.text.strip()
+        if not url.startswith("http"):
+            await message.answer("❌ Ссылка должна начинаться с http:// или https://")
+            return
+        user_temp[user_id]["url"] = url
+        user_states[user_id] = "sponsor_link_text"
+        await message.answer("✏️ Введи текст кнопки (например: Подключить VPN)")
+        return
+
+    elif state == "sponsor_link_text":
+        user_temp[user_id]["button_text"] = message.text.strip()
+        user_states[user_id] = "sponsor_link_name"
+        await message.answer("📝 Введи название для admin-панели (например: VPN Реклама)")
+        return
+
+    elif state == "sponsor_link_name":
+        data = user_temp.get(user_id, {})
+        name = message.text.strip()
+        url = data.get("url")
+        button_text = data.get("button_text")
+        cursor.execute(
+            "INSERT INTO sponsors (type, target, button_text, name) VALUES (?, ?, ?, ?)",
+            ("link", url, button_text, name)
+        )
+        db.commit()
+        user_states.pop(user_id, None)
+        user_temp.pop(user_id, None)
+        await message.answer(f"✅ Спонсор-ссылка «{name}» добавлена!")
+        return
 
     else:
         return
