@@ -822,8 +822,10 @@ async def admin_sponsors(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
 
-    cursor.execute("SELECT id, type, name, button_text, active FROM sponsors ORDER BY id")
-    rows = cursor.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, type, name, button_text, active FROM sponsors ORDER BY id")
+        rows = lc.fetchall()
 
     text = "👥 Спонсоры\n\n"
     if rows:
@@ -1382,11 +1384,13 @@ async def handle_text(message: Message):
         name = message.text.strip()
         channel_id = data.get("channel_id")
         button_text = data.get("button_text")
-        cursor.execute(
-            "INSERT INTO sponsors (type, target, button_text, name) VALUES (?, ?, ?, ?)",
-            ("channel", str(channel_id), button_text, name)
-        )
-        db.commit()
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute(
+                "INSERT INTO sponsors (type, target, button_text, name) VALUES (?, ?, ?, ?)",
+                ("channel", str(channel_id), button_text, name)
+            )
+            db.commit()
         user_states.pop(user_id, None)
         user_temp.pop(user_id, None)
         await message.answer(f"✅ Спонсор-канал «{name}» добавлен!")
@@ -1413,11 +1417,13 @@ async def handle_text(message: Message):
         name = message.text.strip()
         url = data.get("url")
         button_text = data.get("button_text")
-        cursor.execute(
-            "INSERT INTO sponsors (type, target, button_text, name) VALUES (?, ?, ?, ?)",
-            ("link", url, button_text, name)
-        )
-        db.commit()
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute(
+                "INSERT INTO sponsors (type, target, button_text, name) VALUES (?, ?, ?, ?)",
+                ("link", url, button_text, name)
+            )
+            db.commit()
         user_states.pop(user_id, None)
         user_temp.pop(user_id, None)
         await message.answer(f"✅ Спонсор-ссылка «{name}» добавлена!")
