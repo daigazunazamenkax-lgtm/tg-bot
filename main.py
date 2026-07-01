@@ -718,22 +718,6 @@ async def build(callback: CallbackQuery):
         await confirm_referral_if_pending(user_id)
 
     if not is_subscribed:
-        # 3. Читаем историю загрузок после await — нужен свежий лок
-        async with db_lock:
-            lc = db.cursor()
-            lc.execute("SELECT 1 FROM downloads WHERE user_id=? LIMIT 1", (user_id,))
-            had = lc.fetchone()
-            if had:
-                lc.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-                lc.execute("UPDATE users SET blacklisted=1 WHERE user_id=?", (user_id,))
-                db.commit()
-
-        if had:
-            await callback.message.answer(
-                "❌ Вы отписались от канала после получения сборки — вы добавлены в ЧС."
-            )
-            return
-
         await callback.message.answer(
             "❌ Подпишись на канал",
             reply_markup=sub_menu()
