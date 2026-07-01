@@ -589,10 +589,14 @@ async def admin_ban(message: Message):
 
     async with db_lock:
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target_id,))
-        cursor.execute("UPDATE users SET blacklisted=1 WHERE user_id=?", (target_id,))
+        cursor.execute("UPDATE users SET blacklisted=1 WHERE user_id=? AND (blacklisted IS NULL OR blacklisted=0)", (target_id,))
+        already_banned = cursor.rowcount == 0
         db.commit()
 
     await message.answer(f"🚫 Пользователь {target_id} добавлен в ЧС.")
+
+    if already_banned:
+        return
 
     try:
         await bot.send_message(target_id, "❌ Вы добавлены в чёрный список бота. Обратитесь к администрации.")
@@ -617,15 +621,15 @@ async def admin_unban(message: Message):
         lc.execute("SELECT blacklisted FROM users WHERE user_id=?", (target_id,))
         row = lc.fetchone()
         not_found = row is None
-        not_banned = row is not None and row[0] != 1
-        if not not_found and not not_banned:
-            lc.execute("UPDATE users SET blacklisted=0 WHERE user_id=?", (target_id,))
-            db.commit()
+
+        lc.execute("UPDATE users SET blacklisted=0 WHERE user_id=? AND blacklisted=1", (target_id,))
+        actually_unbanned = lc.rowcount > 0
+        db.commit()
 
     if not_found:
         await message.answer(f"⚠️ Пользователь {target_id} не найден в базе.")
         return
-    if not_banned:
+    if not actually_unbanned:
         await message.answer(f"⚠️ Пользователь {target_id} не в ЧС.")
         return
 
@@ -1387,13 +1391,14 @@ async def handle_text(message: Message):
 
             async with db_lock:
                 lc = db.cursor()
-                lc.execute("UPDATE users SET blacklisted=0 WHERE user_id=?", (target_id,))
+                lc.execute("UPDATE users SET blacklisted=0 WHERE user_id=? AND blacklisted=1", (target_id,))
+                actually_unbanned = lc.rowcount > 0
                 db.commit()
 
             user_states.pop(user_id, None)
 
             await message.answer(
-                "✅ Пользователь снят с ЧС"
+                "✅ Пользователь снят с ЧС" if actually_unbanned else "⚠️ Пользователь уже не в ЧС"
             )
 
             return
@@ -1564,19 +1569,23 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
         had_downloads = lc.fetchone()
         if had_downloads:
             lc.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-            lc.execute("UPDATE users SET blacklisted=1 WHERE user_id=?", (user_id,))
+            lc.execute("UPDATE users SET blacklisted=1 WHERE user_id=? AND (blacklisted IS NULL OR blacklisted=0)", (user_id,))
+            was_banned = lc.rowcount > 0
             db.commit()
-            was_banned = True
 
         # Аннулируем реферал если был
         lc.execute("SELECT id, referrer_id FROM referrals WHERE referred_id=? AND confirmed=1", (user_id,))
         row = lc.fetchone()
         if row:
             referral_id, referrer_id = row
-            lc.execute("UPDATE referrals SET confirmed=0 WHERE id=?", (referral_id,))
+            lc.execute("UPDATE referrals SET confirmed=0 WHERE id=? AND confirmed=1", (referral_id,))
+            actually_cancelled = lc.rowcount > 0
             db.commit()
-            lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
-            cnt = lc.fetchone()[0]
+            if not actually_cancelled:
+                referrer_id = None
+            else:
+                lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (referrer_id,))
+                cnt = lc.fetchone()[0]
 
     if was_banned:
         try:
