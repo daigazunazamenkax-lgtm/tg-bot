@@ -122,6 +122,12 @@ CREATE TABLE IF NOT EXISTS sponsors (
 )
 """)
 
+try:
+    cursor.execute("ALTER TABLE sponsors ADD COLUMN invite_link TEXT")
+    db.commit()
+except Exception:
+    pass
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS sponsor_acks (
     user_id INTEGER,
@@ -261,19 +267,20 @@ async def check_sub(user_id):
 
 
 async def get_unmet_sponsors(user_id):
-    lc = db.cursor()
-    lc.execute("SELECT id, type, target, button_text, name FROM sponsors WHERE active=1")
-    all_sponsors = lc.fetchall()
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, type, target, button_text, name, invite_link FROM sponsors WHERE active=1")
+        all_sponsors = lc.fetchall()
 
-    lc2 = db.cursor()
-    lc2.execute("SELECT sponsor_id FROM sponsor_acks WHERE user_id=?", (user_id,))
-    acked_ids = {row[0] for row in lc2.fetchall()}
+        lc2 = db.cursor()
+        lc2.execute("SELECT sponsor_id FROM sponsor_acks WHERE user_id=?", (user_id,))
+        acked_ids = {row[0] for row in lc2.fetchall()}
 
     unmet_channels = []
     unmet_links = []
 
     for sponsor in all_sponsors:
-        sid, stype, target, button_text, name = sponsor
+        sid, stype, target, button_text, name, invite_link = sponsor
         if stype == "channel":
             try:
                 member = await bot.get_chat_member(int(target), user_id)
@@ -291,8 +298,14 @@ async def get_unmet_sponsors(user_id):
 def build_sponsor_keyboard(unmet_channels, unmet_links, build_id):
     kb = InlineKeyboardBuilder()
     for sponsor in unmet_channels:
-        sid, stype, target, button_text, name = sponsor
-        kb.button(text=f"📢 {button_text}", url=f"https://t.me/{target.lstrip('@')}" if not target.startswith("http") else target)
+        sid, stype, target, button_text, name, invite_link = sponsor
+        if invite_link:
+            channel_url = invite_link
+        elif target.startswith("http") or target.startswith("@"):
+            channel_url = target if target.startswith("http") else f"https://t.me/{target.lstrip('@')}"
+        else:
+            channel_url = f"https://t.me/{target.lstrip('@')}"
+        kb.button(text=f"📢 {button_text}", url=channel_url)
     for sponsor in unmet_links:
         sid, stype, target, button_text, name = sponsor
         kb.button(text=f"🔗 {button_text}", url=target)
@@ -1438,16 +1451,40 @@ async def handle_text(message: Message):
         name = message.text.strip()
         channel_id = data.get("channel_id")
         button_text = data.get("button_text")
+
+        invite_link = None
+        try:
+            chat = await bot.get_chat(channel_id)
+            if chat.username:
+                invite_link = f"https://t.me/{chat.username}"
+        except Exception:
+            pass
+
+        if not invite_link:
+            try:
+                link_obj = await bot.create_chat_invite_link(channel_id)
+                invite_link = link_obj.invite_link
+            except Exception:
+                invite_link = None
+
         async with db_lock:
             lc = db.cursor()
             lc.execute(
-                "INSERT INTO sponsors (type, target, button_text, name) VALUES (?, ?, ?, ?)",
-                ("channel", str(channel_id), button_text, name)
+                "INSERT INTO sponsors (type, target, button_text, name, invite_link) VALUES (?, ?, ?, ?, ?)",
+                ("channel", str(channel_id), button_text, name, invite_link)
             )
             db.commit()
         user_states.pop(user_id, None)
         user_temp.pop(user_id, None)
-        await message.answer(f"✅ Спонсор-канал «{name}» добавлен!")
+
+        if invite_link:
+            await message.answer(f"✅ Спонсор-канал «{name}» добавлен!")
+        else:
+            await message.answer(
+                f"⚠️ Спонсор-канал «{name}» добавлен, но не удалось создать ссылку-приглашение.\n"
+                "Проверь, что бот добавлен в этот канал как администратор с правом приглашать пользователей - "
+                "иначе кнопка подписки у пользователей не будет работать."
+            )
         return
 
     elif state == "sponsor_link_url":
