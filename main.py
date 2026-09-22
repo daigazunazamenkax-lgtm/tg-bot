@@ -3,10 +3,11 @@ import os
 import sqlite3
 import random
 import string
+from datetime import datetime, timedelta, timezone
 from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, ChatMemberUpdated
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, ChatJoinRequest
 from aiogram.filters import ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -79,6 +80,12 @@ try:
 except Exception:
     pass
 
+try:
+    cursor.execute("ALTER TABLE users ADD COLUMN coins INTEGER DEFAULT 0")
+    db.commit()
+except Exception:
+    pass
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS referrals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,6 +145,94 @@ CREATE TABLE IF NOT EXISTS sponsor_acks (
 
 db.commit()
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS task_reviewers (
+    user_id INTEGER PRIMARY KEY,
+    added_by INTEGER,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    reward INTEGER NOT NULL,
+    active INTEGER DEFAULT 1,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS task_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    proof_text TEXT,
+    proof_file_id TEXT,
+    proof_file_type TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reviewer_id INTEGER,
+    reviewer_note TEXT,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    reviewed_ts TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS shop_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL,
+    price INTEGER NOT NULL,
+    item_type TEXT NOT NULL DEFAULT 'channel',
+    target TEXT NOT NULL,
+    active INTEGER DEFAULT 1,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    price INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    delivery_link TEXT,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    delivered_ts TIMESTAMP
+)
+""")
+
+db.commit()
+
+
+async def has_reviewer_access(user_id):
+    if user_id in ADMINS:
+        return True
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT 1 FROM task_reviewers WHERE user_id=?", (user_id,))
+        return lc.fetchone() is not None
+
+
+async def get_reviewer_ids():
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT user_id FROM task_reviewers")
+        reviewer_ids = [row[0] for row in lc.fetchall()]
+
+    return list(dict.fromkeys(ADMINS + reviewer_ids))
+
+
+def format_user(user):
+    username = f"@{user.username}" if user.username else "без username"
+    name = " ".join(part for part in [user.first_name, user.last_name] if part)
+    return f"{name or 'Без имени'} ({username}, ID: {user.id})"
+
 
 def main_menu(user_id=None):
 
@@ -151,6 +246,21 @@ def main_menu(user_id=None):
     kb.button(
         text="🤝 Реферальная система",
         callback_data="referral"
+    )
+
+    kb.button(
+        text="📋 Задания",
+        callback_data="tasks"
+    )
+
+    kb.button(
+        text="🛒 Магазин",
+        callback_data="shop"
+    )
+
+    kb.button(
+        text="💰 Мой баланс",
+        callback_data="wallet"
     )
 
     kb.button(
@@ -216,6 +326,26 @@ def admin_menu():
     kb.button(
         text="👥 Спонсоры",
         callback_data="admin_sponsors"
+    )
+
+    kb.button(
+        text="📋 Задания",
+        callback_data="admin_tasks"
+    )
+
+    kb.button(
+        text="🛒 Магазин",
+        callback_data="admin_shop"
+    )
+
+    kb.button(
+        text="👮 Проверяющие",
+        callback_data="admin_reviewers"
+    )
+
+    kb.button(
+        text="🧾 Проверить задания",
+        callback_data="review_tasks"
     )
 
     kb.adjust(1)
@@ -307,7 +437,7 @@ def build_sponsor_keyboard(unmet_channels, unmet_links, build_id):
             channel_url = f"https://t.me/{target.lstrip('@')}"
         kb.button(text=f"📢 {button_text}", url=channel_url)
     for sponsor in unmet_links:
-        sid, stype, target, button_text, name, _ = sponsor
+        sid, stype, target, button_text, name, invite_link = sponsor
         kb.button(text=f"🔗 {button_text}", url=target)
     kb.button(text="✅ Я подписался - проверить", callback_data=f"check_sponsor_sub_{build_id}")
     kb.adjust(1)
@@ -716,6 +846,347 @@ async def builds(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "wallet")
+async def wallet(callback: CallbackQuery):
+    user_id = callback.from_user.id
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT coins FROM users WHERE user_id=?", (user_id,))
+        row = lc.fetchone()
+
+    coins = row[0] if row else 0
+    await callback.message.answer(
+        f"💰 Ваш баланс: {coins} монет\n\n"
+        "Монеты начисляются за одобренные задания и тратятся в магазине."
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "tasks")
+async def user_tasks(callback: CallbackQuery):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "SELECT id, title, reward FROM tasks WHERE active=1 ORDER BY id DESC"
+        )
+        rows = lc.fetchall()
+
+    if not rows:
+        await callback.message.answer("📋 Активных заданий пока нет.")
+        await callback.answer()
+        return
+
+    kb = InlineKeyboardBuilder()
+    for task_id, title, reward in rows:
+        kb.button(
+            text=f"📋 {title} — {reward} монет",
+            callback_data=f"task_view_{task_id}"
+        )
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "📋 Доступные задания:\n\nВыбери задание, выполни его и отправь доказательство на проверку.",
+        reply_markup=kb.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("task_view_"))
+async def task_view(callback: CallbackQuery):
+    try:
+        task_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректное задание.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "SELECT title, description, reward FROM tasks WHERE id=? AND active=1",
+            (task_id,)
+        )
+        task = lc.fetchone()
+        lc.execute(
+            """
+            SELECT status FROM task_submissions
+            WHERE task_id=? AND user_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id, user_id)
+        )
+        previous = lc.fetchone()
+
+    if not task:
+        await callback.answer("Задание больше недоступно.", show_alert=True)
+        return
+
+    title, description, reward = task
+    text = f"📋 {title}\n\n{description}\n\n🎁 Награда: {reward} монет"
+    kb = InlineKeyboardBuilder()
+    if previous and previous[0] == "approved":
+        text += "\n\n✅ Это задание уже одобрено."
+    elif previous and previous[0] == "pending":
+        text += "\n\n⏳ Выполнение уже отправлено на проверку."
+    else:
+        kb.button(
+            text="✅ Отправить выполнение",
+            callback_data=f"task_submit_{task_id}"
+        )
+    kb.button(text="🔙 К заданиям", callback_data="tasks")
+    kb.adjust(1)
+
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("task_submit_"))
+async def task_submit_start(callback: CallbackQuery):
+    try:
+        task_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректное задание.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT title FROM tasks WHERE id=? AND active=1", (task_id,))
+        task = lc.fetchone()
+        lc.execute(
+            """
+            SELECT status FROM task_submissions
+            WHERE task_id=? AND user_id=?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task_id, user_id)
+        )
+        previous = lc.fetchone()
+
+    if not task:
+        await callback.answer("Задание больше недоступно.", show_alert=True)
+        return
+    if previous and previous[0] == "approved":
+        await callback.answer("Это задание уже одобрено.", show_alert=True)
+        return
+    if previous and previous[0] == "pending":
+        await callback.answer("Выполнение уже находится на проверке.", show_alert=True)
+        return
+
+    user_states[user_id] = "task_proof"
+    user_temp[user_id] = {"task_id": task_id}
+    await callback.message.answer(
+        f"📎 Отправь доказательство выполнения задания «{task[0]}».\n\n"
+        "Можно отправить текст, фото с подписью или документ. "
+        "После этого заявка уйдёт администратору на проверку."
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "shop")
+async def shop(callback: CallbackQuery):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "SELECT id, name, price FROM shop_items WHERE active=1 ORDER BY id DESC"
+        )
+        rows = lc.fetchall()
+        lc.execute("SELECT coins FROM users WHERE user_id=?", (callback.from_user.id,))
+        balance_row = lc.fetchone()
+
+    balance = balance_row[0] if balance_row else 0
+    if not rows:
+        await callback.message.answer(
+            f"🛒 Магазин пока пуст.\n\n💰 Ваш баланс: {balance} монет"
+        )
+        await callback.answer()
+        return
+
+    kb = InlineKeyboardBuilder()
+    for item_id, name, price in rows:
+        kb.button(text=f"🛍 {name} — {price} монет", callback_data=f"shop_item_{item_id}")
+    kb.button(text="💰 Мой баланс", callback_data="wallet")
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+
+    await callback.message.answer(
+        f"🛒 Магазин\n\n💰 Ваш баланс: {balance} монет\n\nВыбери товар:",
+        reply_markup=kb.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("shop_item_"))
+async def shop_item(callback: CallbackQuery):
+    try:
+        item_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный товар.", show_alert=True)
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT id, name, description, price
+            FROM shop_items WHERE id=? AND active=1
+            """,
+            (item_id,)
+        )
+        item = lc.fetchone()
+        lc.execute("SELECT coins FROM users WHERE user_id=?", (callback.from_user.id,))
+        balance_row = lc.fetchone()
+
+    if not item:
+        await callback.answer("Товар больше недоступен.", show_alert=True)
+        return
+
+    balance = balance_row[0] if balance_row else 0
+    item_id, name, description, price = item
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Купить за {price} монет", callback_data=f"shop_buy_{item_id}")
+    kb.button(text="🔙 В магазин", callback_data="shop")
+    kb.adjust(1)
+
+    await callback.message.answer(
+        f"🛍 {name}\n\n{description}\n\n"
+        f"Цена: {price} монет\nВаш баланс: {balance} монет",
+        reply_markup=kb.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("shop_buy_"))
+async def shop_buy(callback: CallbackQuery):
+    try:
+        item_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный товар.", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    purchase_id = None
+    item = None
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT id, name, description, price, item_type, target
+            FROM shop_items WHERE id=? AND active=1
+            """,
+            (item_id,)
+        )
+        item = lc.fetchone()
+        lc.execute("SELECT blacklisted, coins FROM users WHERE user_id=?", (user_id,))
+        user_row = lc.fetchone()
+
+        if not item:
+            error = "Товар больше недоступен."
+        elif user_row and user_row[0] == 1:
+            error = "Покупки недоступны для пользователей из ЧС."
+        elif not user_row or user_row[1] < item[3]:
+            error = f"Недостаточно монет. Нужно: {item[3]}."
+        else:
+            lc.execute(
+                """
+                SELECT id FROM purchases
+                WHERE item_id=? AND user_id=? AND status IN ('pending', 'approved', 'delivered')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (item_id, user_id)
+            )
+            existing = lc.fetchone()
+            if existing:
+                error = "Этот товар уже куплен или ожидает выдачи."
+            else:
+                lc.execute(
+                    """
+                    INSERT INTO purchases (item_id, user_id, price, status)
+                    VALUES (?, ?, ?, 'pending')
+                    """,
+                    (item_id, user_id, item[3])
+                )
+                purchase_id = lc.lastrowid
+                lc.execute(
+                    "UPDATE users SET coins=coins-? WHERE user_id=?",
+                    (item[3], user_id)
+                )
+                db.commit()
+                error = None
+
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+
+    try:
+        if item[4] != "channel":
+            raise RuntimeError("Неизвестный тип товара")
+
+        invite = await bot.create_chat_invite_link(
+            int(item[5]),
+            name=f"purchase-{purchase_id}",
+            creates_join_request=True,
+            expire_date=datetime.now(timezone.utc) + timedelta(days=7)
+        )
+        delivery_link = invite.invite_link
+    except Exception:
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute(
+                "UPDATE purchases SET status='failed' WHERE id=? AND status='pending'",
+                (purchase_id,)
+            )
+            if lc.rowcount:
+                lc.execute(
+                    "UPDATE users SET coins=coins+? WHERE user_id=?",
+                    (item[3], user_id)
+                )
+            db.commit()
+
+        await callback.answer(
+            "Не удалось подготовить доступ. Монеты возвращены. Сообщи администратору.",
+            show_alert=True
+        )
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            UPDATE purchases
+            SET status='approved', delivery_link=?
+            WHERE id=? AND status='pending'
+            """,
+            (delivery_link, purchase_id)
+        )
+        db.commit()
+
+    await callback.message.answer(
+        f"✅ Покупка оформлена: {item[1]}\n\n"
+        "Перейди по ссылке ниже и отправь заявку на вступление. "
+        "Бот автоматически одобрит её:\n"
+        f"{delivery_link}"
+    )
+    await callback.answer("Покупка подтверждена")
+
+    for admin_id in ADMINS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🛒 Новая покупка\n\n"
+                f"Товар: {item[1]}\n"
+                f"Цена: {item[3]} монет\n"
+                f"Покупатель: {format_user(callback.from_user)}\n"
+                f"Покупка #{purchase_id}\n"
+                "Доступ выдается автоматически после заявки на вступление."
+            )
+        except Exception:
+            pass
+
+
 @dp.callback_query(F.data.startswith("build_"))
 async def build(callback: CallbackQuery):
 
@@ -951,6 +1422,456 @@ async def admin_del_sponsor(callback: CallbackQuery):
 
     await callback.message.delete()
     await callback.answer("✅ Спонсор удалён", show_alert=True)
+
+
+@dp.callback_query(F.data == "admin_tasks")
+async def admin_tasks(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "SELECT id, title, reward, active FROM tasks ORDER BY id DESC"
+        )
+        rows = lc.fetchall()
+
+    text = "📋 Управление заданиями\n\n"
+    if rows:
+        for task_id, title, reward, active in rows:
+            status = "✅" if active else "❌"
+            text += f"{status} [{task_id}] {title} — {reward} монет\n"
+    else:
+        text += "Заданий пока нет.\n"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить задание", callback_data="admin_add_task")
+    if rows:
+        kb.button(text="🗑 Отключить задание", callback_data="admin_del_task_pick")
+    kb.button(text="🧾 Проверить заявки", callback_data="review_tasks")
+    kb.button(text="🔙 Назад", callback_data="admin_panel")
+    kb.adjust(1)
+
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "admin_add_task")
+async def admin_add_task(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    user_states[callback.from_user.id] = "add_task"
+    await callback.message.answer(
+        "📋 Отправь задание в формате:\n"
+        "Название|Описание|Награда в монетах\n\n"
+        "Пример:\n"
+        "Подписаться на канал|Подпишись на канал и пришли скриншот подписки|10"
+    )
+
+
+@dp.callback_query(F.data == "admin_del_task_pick")
+async def admin_del_task_pick(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, title FROM tasks WHERE active=1 ORDER BY id")
+        rows = lc.fetchall()
+
+    if not rows:
+        await callback.answer("Активных заданий нет.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    for task_id, title in rows:
+        kb.button(text=f"🗑 {title}", callback_data=f"admin_del_task_{task_id}")
+    kb.button(text="🔙 Назад", callback_data="admin_tasks")
+    kb.adjust(1)
+    await callback.message.answer(
+        "Выбери задание для отключения:", reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_del_task_"))
+async def admin_del_task(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        task_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("UPDATE tasks SET active=0 WHERE id=? AND active=1", (task_id,))
+        changed = lc.rowcount
+        db.commit()
+
+    await callback.answer(
+        "✅ Задание отключено" if changed else "Задание уже отключено",
+        show_alert=True
+    )
+
+
+@dp.callback_query(F.data == "admin_shop")
+async def admin_shop(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT id, name, price, target, active
+            FROM shop_items ORDER BY id DESC
+            """
+        )
+        rows = lc.fetchall()
+
+    text = "🛒 Управление магазином\n\n"
+    if rows:
+        for item_id, name, price, target, active in rows:
+            status = "✅" if active else "❌"
+            text += f"{status} [{item_id}] {name} — {price} монет | канал {target}\n"
+    else:
+        text += "Товаров пока нет.\n"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить доступ в канал", callback_data="admin_add_shop")
+    if rows:
+        kb.button(text="🗑 Отключить товар", callback_data="admin_del_shop_pick")
+    kb.button(text="🔙 Назад", callback_data="admin_panel")
+    kb.adjust(1)
+
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "admin_add_shop")
+async def admin_add_shop(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    user_states[callback.from_user.id] = "add_shop"
+    await callback.message.answer(
+        "🛒 Отправь товар в формате:\n"
+        "Название|Описание|Цена в монетах|ID приватного канала\n\n"
+        "Пример:\n"
+        "Доступ в приватный канал|Доступ к закрытому каналу на 30 дней|100|-1001234567890\n\n"
+        "Бот должен быть администратором канала с правом приглашать пользователей."
+    )
+
+
+@dp.callback_query(F.data == "admin_del_shop_pick")
+async def admin_del_shop_pick(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, name FROM shop_items WHERE active=1 ORDER BY id")
+        rows = lc.fetchall()
+
+    if not rows:
+        await callback.answer("Активных товаров нет.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    for item_id, name in rows:
+        kb.button(text=f"🗑 {name}", callback_data=f"admin_del_shop_{item_id}")
+    kb.button(text="🔙 Назад", callback_data="admin_shop")
+    kb.adjust(1)
+    await callback.message.answer(
+        "Выбери товар для отключения:", reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_del_shop_"))
+async def admin_del_shop(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        item_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "UPDATE shop_items SET active=0 WHERE id=? AND active=1",
+            (item_id,)
+        )
+        changed = lc.rowcount
+        db.commit()
+
+    await callback.answer(
+        "✅ Товар отключён" if changed else "Товар уже отключён",
+        show_alert=True
+    )
+
+
+@dp.callback_query(F.data == "admin_reviewers")
+async def admin_reviewers(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT user_id, ts FROM task_reviewers ORDER BY user_id")
+        rows = lc.fetchall()
+
+    text = "👮 Проверяющие задания\n\n"
+    if rows:
+        text += "\n".join(f"• {row[0]}" for row in rows)
+    else:
+        text += "Дополнительных проверяющих нет.\n"
+    text += "\n\nОсновной администратор всегда имеет полный доступ."
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Выдать доступ", callback_data="admin_add_reviewer")
+    if rows:
+        kb.button(text="➖ Снять доступ", callback_data="admin_del_reviewer_pick")
+    kb.button(text="🔙 Назад", callback_data="admin_panel")
+    kb.adjust(1)
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "admin_add_reviewer")
+async def admin_add_reviewer(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    user_states[callback.from_user.id] = "add_reviewer"
+    await callback.message.answer(
+        "👮 Отправь Telegram ID пользователя, которому выдать доступ к проверке заданий."
+    )
+
+
+@dp.callback_query(F.data == "admin_del_reviewer_pick")
+async def admin_del_reviewer_pick(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT user_id FROM task_reviewers ORDER BY user_id")
+        rows = lc.fetchall()
+
+    if not rows:
+        await callback.answer("Дополнительных проверяющих нет.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    for (reviewer_id,) in rows:
+        kb.button(
+            text=f"➖ {reviewer_id}",
+            callback_data=f"admin_del_reviewer_{reviewer_id}"
+        )
+    kb.button(text="🔙 Назад", callback_data="admin_reviewers")
+    kb.adjust(1)
+    await callback.message.answer(
+        "Выбери пользователя, у которого снять доступ:",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_del_reviewer_"))
+async def admin_del_reviewer(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        reviewer_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("DELETE FROM task_reviewers WHERE user_id=?", (reviewer_id,))
+        changed = lc.rowcount
+        db.commit()
+
+    await callback.answer(
+        "✅ Доступ снят" if changed else "Пользователь не найден",
+        show_alert=True
+    )
+
+
+async def send_pending_reviews(target):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT s.id, t.title, t.reward, s.user_id, s.ts
+            FROM task_submissions s
+            JOIN tasks t ON t.id=s.task_id
+            WHERE s.status='pending'
+            ORDER BY s.id ASC
+            LIMIT 30
+            """
+        )
+        rows = lc.fetchall()
+
+    if not rows:
+        text = "🧾 Заявок на проверку нет."
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 Назад", callback_data="admin_panel")
+        await target.answer(text, reply_markup=kb.as_markup())
+        return
+
+    text = "🧾 Заявки на проверку:\n\n"
+    kb = InlineKeyboardBuilder()
+    for submission_id, title, reward, user_id, ts in rows:
+        text += f"#{submission_id} | {title} | {reward} монет | ID {user_id}\n"
+        kb.button(
+            text=f"✅ #{submission_id}",
+            callback_data=f"task_approve_{submission_id}"
+        )
+        kb.button(
+            text=f"❌ #{submission_id}",
+            callback_data=f"task_reject_{submission_id}"
+        )
+    kb.button(text="🔙 Назад", callback_data="admin_panel")
+    kb.adjust(2, 1)
+    await target.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "review_tasks")
+async def review_tasks(callback: CallbackQuery):
+    if not await has_reviewer_access(callback.from_user.id):
+        return
+    await send_pending_reviews(callback.message)
+    await callback.answer()
+
+
+@dp.message(F.text == "/review")
+async def review_command(message: Message):
+    if not await has_reviewer_access(message.from_user.id):
+        return
+    await send_pending_reviews(message)
+
+
+@dp.callback_query(F.data.startswith("task_approve_"))
+async def approve_task(callback: CallbackQuery):
+    if not await has_reviewer_access(callback.from_user.id):
+        return
+
+    try:
+        submission_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT s.user_id, t.title, t.reward
+            FROM task_submissions s
+            JOIN tasks t ON t.id=s.task_id
+            WHERE s.id=? AND s.status='pending'
+            """,
+            (submission_id,)
+        )
+        row = lc.fetchone()
+        if row:
+            target_user_id, title, reward = row
+            lc.execute(
+                """
+                UPDATE task_submissions
+                SET status='approved', reviewer_id=?, reviewed_ts=CURRENT_TIMESTAMP
+                WHERE id=? AND status='pending'
+                """,
+                (callback.from_user.id, submission_id)
+            )
+            changed = lc.rowcount
+            if changed:
+                lc.execute(
+                    "UPDATE users SET coins=COALESCE(coins, 0)+? WHERE user_id=?",
+                    (reward, target_user_id)
+                )
+            db.commit()
+        else:
+            changed = 0
+
+    if not changed:
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"✅ Задание «{title}» одобрено!\n"
+            f"Начислено: {reward} монет."
+        )
+    except Exception:
+        pass
+    await callback.answer("✅ Выполнение одобрено")
+
+
+@dp.callback_query(F.data.startswith("task_reject_"))
+async def reject_task(callback: CallbackQuery):
+    if not await has_reviewer_access(callback.from_user.id):
+        return
+
+    try:
+        submission_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT s.user_id, t.title
+            FROM task_submissions s
+            JOIN tasks t ON t.id=s.task_id
+            WHERE s.id=? AND s.status='pending'
+            """,
+            (submission_id,)
+        )
+        row = lc.fetchone()
+        if row:
+            target_user_id, title = row
+            lc.execute(
+                """
+                UPDATE task_submissions
+                SET status='rejected', reviewer_id=?,
+                    reviewer_note='Отклонено проверяющим',
+                    reviewed_ts=CURRENT_TIMESTAMP
+                WHERE id=? AND status='pending'
+                """,
+                (callback.from_user.id, submission_id)
+            )
+            changed = lc.rowcount
+            db.commit()
+        else:
+            changed = 0
+
+    if not changed:
+        await callback.answer("Заявка уже обработана.", show_alert=True)
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    try:
+        await bot.send_message(
+            target_user_id,
+            f"❌ Выполнение задания «{title}» отклонено.\n"
+            "Проверь условия и отправь выполнение ещё раз."
+        )
+    except Exception:
+        pass
+    await callback.answer("Заявка отклонена")
 
 
 @dp.callback_query(F.data == "main_menu")
@@ -1233,6 +2154,215 @@ async def handle_text(message: Message):
     state = user_states.get(user_id)
 
     if not state:
+        return
+
+    if state == "task_proof":
+        data = user_temp.get(user_id, {})
+        task_id = data.get("task_id")
+        proof_text = message.text or message.caption or ""
+        proof_file_id = None
+        proof_file_type = None
+        if message.photo:
+            proof_file_id = message.photo[-1].file_id
+            proof_file_type = "photo"
+        elif message.document:
+            proof_file_id = message.document.file_id
+            proof_file_type = "document"
+
+        if not proof_text and not proof_file_id:
+            await message.answer("❌ Отправь текст, фото с подписью или документ.")
+            return
+
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute(
+                "SELECT title FROM tasks WHERE id=? AND active=1",
+                (task_id,)
+            )
+            task = lc.fetchone()
+            lc.execute(
+                """
+                SELECT status FROM task_submissions
+                WHERE task_id=? AND user_id=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (task_id, user_id)
+            )
+            previous = lc.fetchone()
+            if task and (not previous or previous[0] == "rejected"):
+                lc.execute(
+                    """
+                    INSERT INTO task_submissions
+                    (task_id, user_id, proof_text, proof_file_id, proof_file_type)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (task_id, user_id, proof_text, proof_file_id, proof_file_type)
+                )
+                submission_id = lc.lastrowid
+                db.commit()
+            else:
+                submission_id = None
+
+        user_states.pop(user_id, None)
+        user_temp.pop(user_id, None)
+
+        if not task:
+            await message.answer("❌ Задание больше недоступно.")
+            return
+        if not submission_id:
+            status_text = "уже одобрено" if previous and previous[0] == "approved" else "уже находится на проверке"
+            await message.answer(f"❌ Выполнение {status_text}.")
+            return
+
+        await message.answer(
+            "✅ Выполнение отправлено на проверку. "
+            "После решения проверяющего ты получишь уведомление."
+        )
+
+        reviewer_ids = await get_reviewer_ids()
+        proof_header = (
+            f"🧾 Новая заявка на проверку #{submission_id}\n\n"
+            f"Задание: {task[0]}\n"
+            f"Пользователь: {format_user(message.from_user)}\n"
+            f"ID пользователя: {user_id}\n\n"
+            f"Доказательство:\n{proof_text or 'см. прикреплённый файл'}"
+        )
+        kb = InlineKeyboardBuilder()
+        kb.button(text="✅ Одобрить", callback_data=f"task_approve_{submission_id}")
+        kb.button(text="❌ Отклонить", callback_data=f"task_reject_{submission_id}")
+        kb.adjust(2)
+
+        for reviewer_id in reviewer_ids:
+            try:
+                if proof_file_type == "photo":
+                    await bot.send_photo(
+                        reviewer_id,
+                        photo=proof_file_id,
+                        caption=proof_header[:1024],
+                        reply_markup=kb.as_markup()
+                    )
+                elif proof_file_type == "document":
+                    await bot.send_document(
+                        reviewer_id,
+                        document=proof_file_id,
+                        caption=proof_header[:1024],
+                        reply_markup=kb.as_markup()
+                    )
+                else:
+                    await bot.send_message(
+                        reviewer_id,
+                        proof_header,
+                        reply_markup=kb.as_markup()
+                    )
+            except Exception:
+                pass
+        return
+
+    if state == "add_task":
+        try:
+            data = message.text.split("|", 2)
+            if len(data) < 3:
+                await message.answer("❌ Формат: Название|Описание|Награда")
+                return
+
+            title = data[0].strip()
+            description = data[1].strip()
+            reward = int(data[2].strip())
+            if not title or not description or reward <= 0:
+                raise ValueError
+
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute(
+                    """
+                    INSERT INTO tasks (title, description, reward, active)
+                    VALUES (?, ?, ?, 1)
+                    """,
+                    (title, description, reward)
+                )
+                db.commit()
+
+            user_states.pop(user_id, None)
+            await message.answer(f"✅ Задание добавлено: {title}")
+        except (ValueError, TypeError, AttributeError):
+            await message.answer(
+                "❌ Неверный формат. Нужно: Название|Описание|положительная награда"
+            )
+        return
+
+    if state == "add_shop":
+        try:
+            data = message.text.split("|", 3)
+            if len(data) < 4:
+                await message.answer("❌ Формат: Название|Описание|Цена|ID канала")
+                return
+
+            name = data[0].strip()
+            description = data[1].strip()
+            price = int(data[2].strip())
+            channel_id = int(data[3].strip())
+            if not name or not description or price <= 0:
+                raise ValueError
+
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute(
+                    """
+                    INSERT INTO shop_items
+                    (name, description, price, item_type, target, active)
+                    VALUES (?, ?, ?, 'channel', ?, 1)
+                    """,
+                    (name, description, price, str(channel_id))
+                )
+                db.commit()
+
+            user_states.pop(user_id, None)
+            await message.answer(
+                f"✅ Товар добавлен: {name}\n"
+                "Проверь, что бот администратор указанного канала."
+            )
+        except (ValueError, TypeError, AttributeError):
+            await message.answer(
+                "❌ Неверный формат. Нужно: Название|Описание|положительная цена|ID канала"
+            )
+        return
+
+    if state == "add_reviewer":
+        try:
+            reviewer_id = int(message.text.strip())
+            if reviewer_id <= 0:
+                raise ValueError
+            if reviewer_id in ADMINS:
+                user_states.pop(user_id, None)
+                await message.answer("Этот пользователь уже является основным администратором.")
+                return
+
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute(
+                    """
+                    INSERT OR REPLACE INTO task_reviewers (user_id, added_by)
+                    VALUES (?, ?)
+                    """,
+                    (reviewer_id, user_id)
+                )
+                db.commit()
+
+            user_states.pop(user_id, None)
+            await message.answer(
+                f"✅ Пользователю {reviewer_id} выдан доступ к проверке заданий.\n"
+                "Он может открыть проверку командой /review."
+            )
+            try:
+                await bot.send_message(
+                    reviewer_id,
+                    "👮 Вам выдан доступ к проверке заданий.\n"
+                    "Открыть список заявок: /review"
+                )
+            except Exception:
+                pass
+        except (ValueError, TypeError, AttributeError):
+            await message.answer("❌ ID должен быть положительным числом.")
         return
 
     if state == "add":
@@ -1583,6 +2713,56 @@ async def daily_backup():
                 pass
 
 
+@dp.chat_join_request()
+async def on_shop_join_request(request: ChatJoinRequest):
+    invite_link = request.invite_link.invite_link if request.invite_link else None
+    if not invite_link:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT p.id, s.name
+            FROM purchases p
+            JOIN shop_items s ON s.id=p.item_id
+            WHERE p.user_id=? AND p.status='approved'
+              AND s.target=? AND p.delivery_link=?
+            ORDER BY p.id DESC LIMIT 1
+            """,
+            (request.from_user.id, str(request.chat.id), invite_link)
+        )
+        purchase = lc.fetchone()
+
+    if not purchase:
+        return
+
+    try:
+        await bot.approve_chat_join_request(request.chat.id, request.from_user.id)
+    except Exception:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            UPDATE purchases
+            SET status='delivered', delivered_ts=CURRENT_TIMESTAMP
+            WHERE id=? AND status='approved'
+            """,
+            (purchase[0],)
+        )
+        db.commit()
+
+    try:
+        await bot.send_message(
+            request.from_user.id,
+            f"✅ Заявка одобрена. Доступ к товару «{purchase[1]}» выдан."
+        )
+    except Exception:
+        pass
+
+
 @dp.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
 async def on_user_join_channel(event: ChatMemberUpdated):
     if event.chat.id != CHANNEL_ID:
@@ -1652,7 +2832,15 @@ async def main():
 
     await asyncio.gather(
         run_web(),
-        dp.start_polling(bot, allowed_updates=["message", "callback_query", "chat_member"]),
+        dp.start_polling(
+            bot,
+            allowed_updates=[
+                "message",
+                "callback_query",
+                "chat_member",
+                "chat_join_request"
+            ]
+        ),
         daily_backup()
     )
 
