@@ -277,6 +277,16 @@ def main_menu(user_id=None):
     )
 
     kb.button(
+        text="📋 Задания",
+        callback_data="tasks"
+    )
+
+    kb.button(
+        text="💰 Мой баланс",
+        callback_data="wallet"
+    )
+
+    kb.button(
         text="📢 Канал",
         url=CHANNEL_LINK
     )
@@ -875,7 +885,7 @@ async def wallet(callback: CallbackQuery):
 
     coins = row[0] if row else 0
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔙 В магазин", callback_data="shop")
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
     kb.adjust(1)
     await callback.message.answer(
         f"💰 Ваш баланс: {coins} монет\n\n"
@@ -909,7 +919,7 @@ async def user_tasks(callback: CallbackQuery):
 
     if not rows:
         kb = InlineKeyboardBuilder()
-        kb.button(text="🔙 В магазин", callback_data="shop")
+        kb.button(text="🔙 Главное меню", callback_data="main_menu")
         await callback.message.answer(
             "📋 Активных заданий пока нет.",
             reply_markup=kb.as_markup()
@@ -923,7 +933,7 @@ async def user_tasks(callback: CallbackQuery):
             text=f"📋 {title} — {reward} монет",
             callback_data=f"task_view_{task_id}"
         )
-    kb.button(text="🔙 В магазин", callback_data="shop")
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
     kb.adjust(1)
 
     await callback.message.answer(
@@ -1033,13 +1043,8 @@ async def shop(callback: CallbackQuery):
             "SELECT id, name, price FROM shop_items WHERE active=1 ORDER BY id DESC"
         )
         rows = lc.fetchall()
-        lc.execute("SELECT coins FROM users WHERE user_id=?", (callback.from_user.id,))
-        balance_row = lc.fetchone()
 
-    balance = balance_row[0] if balance_row else 0
     kb = InlineKeyboardBuilder()
-    kb.button(text="📋 Задания", callback_data="tasks")
-    kb.button(text="💰 Мой баланс", callback_data="wallet")
     kb.button(text="🎟 Ввести промокод", callback_data="promo_enter")
     for item_id, name, price in rows:
         kb.button(text=f"🛍 {name} — {price} монет", callback_data=f"shop_item_{item_id}")
@@ -1047,12 +1052,12 @@ async def shop(callback: CallbackQuery):
     kb.adjust(1)
 
     if rows:
-        shop_text = "Выбери товар или нужный раздел:"
+        shop_text = "Выбери товар или введи промокод:"
     else:
-        shop_text = "Товаров пока нет. Можно открыть задания, баланс или ввести промокод."
+        shop_text = "Товаров пока нет. Можно ввести промокод."
 
     await callback.message.answer(
-        f"🛒 Магазин\n\n💰 Ваш баланс: {balance} монет\n\n{shop_text}",
+        f"🛒 Магазин\n\n{shop_text}",
         reply_markup=kb.as_markup()
     )
     await callback.answer()
