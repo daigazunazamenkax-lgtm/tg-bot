@@ -206,6 +206,29 @@ CREATE TABLE IF NOT EXISTS purchases (
 )
 """)
 
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS promo_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    reward_coins INTEGER NOT NULL,
+    max_uses INTEGER NOT NULL DEFAULT 0,
+    uses_count INTEGER NOT NULL DEFAULT 0,
+    expires_at TIMESTAMP,
+    active INTEGER DEFAULT 1,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS promo_redemptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    promo_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (promo_id, user_id)
+)
+""")
+
 db.commit()
 
 
@@ -249,18 +272,8 @@ def main_menu(user_id=None):
     )
 
     kb.button(
-        text="📋 Задания",
-        callback_data="tasks"
-    )
-
-    kb.button(
         text="🛒 Магазин",
         callback_data="shop"
-    )
-
-    kb.button(
-        text="💰 Мой баланс",
-        callback_data="wallet"
     )
 
     kb.button(
@@ -336,6 +349,11 @@ def admin_menu():
     kb.button(
         text="🛒 Магазин",
         callback_data="admin_shop"
+    )
+
+    kb.button(
+        text="🎟 Промокоды",
+        callback_data="admin_promos"
     )
 
     kb.button(
@@ -856,9 +874,13 @@ async def wallet(callback: CallbackQuery):
         row = lc.fetchone()
 
     coins = row[0] if row else 0
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 В магазин", callback_data="shop")
+    kb.adjust(1)
     await callback.message.answer(
         f"💰 Ваш баланс: {coins} монет\n\n"
-        "Монеты начисляются за одобренные задания и тратятся в магазине."
+        "Монеты начисляются за одобренные задания и тратятся в магазине.",
+        reply_markup=kb.as_markup()
     )
     await callback.answer()
 
@@ -868,12 +890,30 @@ async def user_tasks(callback: CallbackQuery):
     async with db_lock:
         lc = db.cursor()
         lc.execute(
-            "SELECT id, title, reward FROM tasks WHERE active=1 ORDER BY id DESC"
+            """
+            SELECT t.id, t.title, t.reward
+            FROM tasks t
+            WHERE t.active=1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM task_submissions s
+                  WHERE s.task_id=t.id
+                    AND s.user_id=?
+                    AND s.status IN ('pending', 'approved')
+              )
+            ORDER BY t.id DESC
+            """,
+            (callback.from_user.id,)
         )
         rows = lc.fetchall()
 
     if not rows:
-        await callback.message.answer("📋 Активных заданий пока нет.")
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🔙 В магазин", callback_data="shop")
+        await callback.message.answer(
+            "📋 Активных заданий пока нет.",
+            reply_markup=kb.as_markup()
+        )
         await callback.answer()
         return
 
@@ -883,7 +923,7 @@ async def user_tasks(callback: CallbackQuery):
             text=f"📋 {title} — {reward} монет",
             callback_data=f"task_view_{task_id}"
         )
-    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.button(text="🔙 В магазин", callback_data="shop")
     kb.adjust(1)
 
     await callback.message.answer(
@@ -997,23 +1037,33 @@ async def shop(callback: CallbackQuery):
         balance_row = lc.fetchone()
 
     balance = balance_row[0] if balance_row else 0
-    if not rows:
-        await callback.message.answer(
-            f"🛒 Магазин пока пуст.\n\n💰 Ваш баланс: {balance} монет"
-        )
-        await callback.answer()
-        return
-
     kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Задания", callback_data="tasks")
+    kb.button(text="💰 Мой баланс", callback_data="wallet")
+    kb.button(text="🎟 Ввести промокод", callback_data="promo_enter")
     for item_id, name, price in rows:
         kb.button(text=f"🛍 {name} — {price} монет", callback_data=f"shop_item_{item_id}")
-    kb.button(text="💰 Мой баланс", callback_data="wallet")
     kb.button(text="🔙 Главное меню", callback_data="main_menu")
     kb.adjust(1)
 
+    if rows:
+        shop_text = "Выбери товар или нужный раздел:"
+    else:
+        shop_text = "Товаров пока нет. Можно открыть задания, баланс или ввести промокод."
+
     await callback.message.answer(
-        f"🛒 Магазин\n\n💰 Ваш баланс: {balance} монет\n\nВыбери товар:",
+        f"🛒 Магазин\n\n💰 Ваш баланс: {balance} монет\n\n{shop_text}",
         reply_markup=kb.as_markup()
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "promo_enter")
+async def promo_enter(callback: CallbackQuery):
+    user_states[callback.from_user.id] = "redeem_promo"
+    await callback.message.answer(
+        "🎟 Отправь промокод одним сообщением.\n\n"
+        "Код можно вводить заглавными или строчными буквами."
     )
     await callback.answer()
 
@@ -1085,20 +1135,26 @@ async def shop_buy(callback: CallbackQuery):
 
         if not item:
             error = "Товар больше недоступен."
-        elif user_row and user_row[0] == 1:
+        elif not user_row:
+            error = "Сначала запусти бота командой /start."
+        elif item[4] == "unban" and user_row[0] != 1:
+            error = "У тебя нет активного ЧС."
+        elif user_row[0] == 1 and item[4] != "unban":
             error = "Покупки недоступны для пользователей из ЧС."
-        elif not user_row or user_row[1] < item[3]:
+        elif user_row[1] < item[3]:
             error = f"Недостаточно монет. Нужно: {item[3]}."
         else:
-            lc.execute(
-                """
-                SELECT id FROM purchases
-                WHERE item_id=? AND user_id=? AND status IN ('pending', 'approved', 'delivered')
-                ORDER BY id DESC LIMIT 1
-                """,
-                (item_id, user_id)
-            )
-            existing = lc.fetchone()
+            existing = None
+            if item[4] != "unban":
+                lc.execute(
+                    """
+                    SELECT id FROM purchases
+                    WHERE item_id=? AND user_id=? AND status IN ('pending', 'approved', 'delivered')
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (item_id, user_id)
+                )
+                existing = lc.fetchone()
             if existing:
                 error = "Этот товар уже куплен или ожидает выдачи."
             else:
@@ -1119,6 +1175,49 @@ async def shop_buy(callback: CallbackQuery):
 
     if error:
         await callback.answer(error, show_alert=True)
+        return
+
+    if item[4] == "unban":
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute(
+                """
+                UPDATE purchases
+                SET status='delivered', delivered_ts=CURRENT_TIMESTAMP
+                WHERE id=? AND status='pending'
+                """,
+                (purchase_id,)
+            )
+            changed = lc.rowcount
+            if changed:
+                lc.execute(
+                    "UPDATE users SET blacklisted=0 WHERE user_id=?",
+                    (user_id,)
+                )
+            db.commit()
+
+        if not changed:
+            await callback.answer("Покупка уже обработана.", show_alert=True)
+            return
+
+        await callback.message.answer(
+            f"✅ Покупка оформлена: {item[1]}\n\n"
+            "Чёрный список снят, теперь снова доступны задания, "
+            "магазин и скачивание сборок."
+        )
+        await callback.answer("✅ ЧС снят")
+
+        for admin_id in ADMINS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🔓 Пользователь купил снятие ЧС\n\n"
+                    f"Покупатель: {format_user(callback.from_user)}\n"
+                    f"Цена: {item[3]} монет\n"
+                    f"Покупка #{purchase_id}"
+                )
+            except Exception:
+                pass
         return
 
     try:
@@ -1524,7 +1623,7 @@ async def admin_shop(callback: CallbackQuery):
         lc = db.cursor()
         lc.execute(
             """
-            SELECT id, name, price, target, active
+            SELECT id, name, price, item_type, target, active
             FROM shop_items ORDER BY id DESC
             """
         )
@@ -1532,20 +1631,135 @@ async def admin_shop(callback: CallbackQuery):
 
     text = "🛒 Управление магазином\n\n"
     if rows:
-        for item_id, name, price, target, active in rows:
+        for item_id, name, price, item_type, target, active in rows:
             status = "✅" if active else "❌"
-            text += f"{status} [{item_id}] {name} — {price} монет | канал {target}\n"
+            item_kind = "снятие ЧС" if item_type == "unban" else f"канал {target}"
+            text += f"{status} [{item_id}] {name} — {price} монет | {item_kind}\n"
     else:
         text += "Товаров пока нет.\n"
 
     kb = InlineKeyboardBuilder()
     kb.button(text="➕ Добавить доступ в канал", callback_data="admin_add_shop")
+    kb.button(text="➕ Добавить снятие ЧС", callback_data="admin_add_shop_unban")
     if rows:
         kb.button(text="🗑 Отключить товар", callback_data="admin_del_shop_pick")
     kb.button(text="🔙 Назад", callback_data="admin_panel")
     kb.adjust(1)
 
     await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "admin_promos")
+async def admin_promos(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            """
+            SELECT id, code, reward_coins, max_uses, uses_count, expires_at, active
+            FROM promo_codes
+            ORDER BY id DESC
+            """
+        )
+        rows = lc.fetchall()
+
+    text = "🎟 Управление промокодами\n\n"
+    if rows:
+        for promo_id, code, reward, max_uses, uses_count, expires_at, active in rows:
+            status = "✅" if active else "❌"
+            limit = "∞" if max_uses == 0 else str(max_uses)
+            expiry = f", до {expires_at[:16]}" if expires_at else ""
+            text += (
+                f"{status} [{promo_id}] {code} — +{reward} монет | "
+                f"{uses_count}/{limit}{expiry}\n"
+            )
+    else:
+        text += "Промокодов пока нет.\n"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="➕ Добавить промокод", callback_data="admin_add_promo")
+    if any(row[6] for row in rows):
+        kb.button(
+            text="🗑 Отключить промокод",
+            callback_data="admin_disable_promo_pick"
+        )
+    kb.button(text="🔙 Назад", callback_data="admin_panel")
+    kb.adjust(1)
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "admin_add_promo")
+async def admin_add_promo(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    user_states[callback.from_user.id] = "add_promo"
+    await callback.message.answer(
+        "🎟 Отправь промокод в формате:\n"
+        "КОД|Монеты|Максимум использований|Срок в днях\n\n"
+        "Пример:\n"
+        "WELCOME|100|50|7\n\n"
+        "Максимум использований 0 = без ограничений.\n"
+        "Срок 0 = без срока действия."
+    )
+
+
+@dp.callback_query(F.data == "admin_disable_promo_pick")
+async def admin_disable_promo_pick(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "SELECT id, code FROM promo_codes WHERE active=1 ORDER BY id DESC"
+        )
+        rows = lc.fetchall()
+
+    if not rows:
+        await callback.answer("Активных промокодов нет.", show_alert=True)
+        return
+
+    kb = InlineKeyboardBuilder()
+    for promo_id, code in rows:
+        kb.button(
+            text=f"🗑 {code}",
+            callback_data=f"admin_disable_promo_{promo_id}"
+        )
+    kb.button(text="🔙 Назад", callback_data="admin_promos")
+    kb.adjust(1)
+    await callback.message.answer(
+        "Выбери промокод для отключения:",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_disable_promo_"))
+async def admin_disable_promo(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        promo_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer("Некорректный промокод.", show_alert=True)
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "UPDATE promo_codes SET active=0 WHERE id=? AND active=1",
+            (promo_id,)
+        )
+        changed = lc.rowcount
+        db.commit()
+
+    await callback.answer(
+        "✅ Промокод отключён" if changed else "Промокод уже отключён",
+        show_alert=True
+    )
 
 
 @dp.callback_query(F.data == "admin_add_shop")
@@ -1560,6 +1774,20 @@ async def admin_add_shop(callback: CallbackQuery):
         "Пример:\n"
         "Доступ в приватный канал|Доступ к закрытому каналу на 30 дней|100|-1001234567890\n\n"
         "Бот должен быть администратором канала с правом приглашать пользователей."
+    )
+
+
+@dp.callback_query(F.data == "admin_add_shop_unban")
+async def admin_add_shop_unban(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    user_states[callback.from_user.id] = "add_shop_unban"
+    await callback.message.answer(
+        "🔓 Отправь товар для снятия ЧС в формате:\n"
+        "Название|Описание|Цена в монетах\n\n"
+        "Пример:\n"
+        "Снятие ЧС|Разблокировка доступа к боту|250"
     )
 
 
@@ -2325,6 +2553,190 @@ async def handle_text(message: Message):
             await message.answer(
                 "❌ Неверный формат. Нужно: Название|Описание|положительная цена|ID канала"
             )
+        return
+
+    if state == "add_shop_unban":
+        try:
+            data = message.text.split("|", 2)
+            if len(data) < 3:
+                await message.answer("❌ Формат: Название|Описание|Цена")
+                return
+
+            name = data[0].strip()
+            description = data[1].strip()
+            price = int(data[2].strip())
+            if not name or not description or price <= 0:
+                raise ValueError
+
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute(
+                    """
+                    INSERT INTO shop_items
+                    (name, description, price, item_type, target, active)
+                    VALUES (?, ?, ?, 'unban', 'unban', 1)
+                    """,
+                    (name, description, price)
+                )
+                db.commit()
+
+            user_states.pop(user_id, None)
+            await message.answer(f"✅ Товар для снятия ЧС добавлен: {name}")
+        except (ValueError, TypeError, AttributeError):
+            await message.answer(
+                "❌ Неверный формат. Нужно: Название|Описание|положительная цена"
+            )
+        return
+
+    if state == "add_promo":
+        try:
+            data = message.text.split("|", 3)
+            if len(data) < 4:
+                await message.answer(
+                    "❌ Формат: КОД|Монеты|Максимум использований|Срок в днях"
+                )
+                return
+
+            code = data[0].strip().upper()
+            reward_coins = int(data[1].strip())
+            max_uses = int(data[2].strip())
+            expires_days = int(data[3].strip())
+
+            if (
+                not 3 <= len(code) <= 32
+                or not all(char.isalnum() or char in "_-" for char in code)
+                or reward_coins <= 0
+                or max_uses < 0
+                or expires_days < 0
+            ):
+                raise ValueError
+
+            expires_at = None
+            if expires_days:
+                expires_at = (
+                    datetime.now(timezone.utc) + timedelta(days=expires_days)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+
+            try:
+                async with db_lock:
+                    lc = db.cursor()
+                    lc.execute(
+                        """
+                        INSERT INTO promo_codes
+                        (code, reward_coins, max_uses, expires_at, active)
+                        VALUES (?, ?, ?, ?, 1)
+                        """,
+                        (code, reward_coins, max_uses, expires_at)
+                    )
+                    db.commit()
+            except sqlite3.IntegrityError:
+                await message.answer("❌ Такой промокод уже существует.")
+                return
+
+            user_states.pop(user_id, None)
+            limit = "без ограничений" if max_uses == 0 else str(max_uses)
+            expiry = "без срока" if not expires_at else f"на {expires_days} дн."
+            await message.answer(
+                f"✅ Промокод {code} добавлен.\n"
+                f"Награда: {reward_coins} монет | Лимит: {limit} | {expiry}"
+            )
+        except (ValueError, TypeError, AttributeError):
+            await message.answer(
+                "❌ Неверный формат. Пример: WELCOME|100|50|7"
+            )
+        return
+
+    if state == "redeem_promo":
+        code = (message.text or "").strip().upper()
+        if not code:
+            await message.answer("❌ Отправь промокод текстом.")
+            return
+
+        error = None
+        reward_coins = 0
+        try:
+            async with db_lock:
+                lc = db.cursor()
+                lc.execute(
+                    """
+                    SELECT id, reward_coins, max_uses, uses_count, expires_at, active
+                    FROM promo_codes
+                    WHERE code=? COLLATE NOCASE
+                    """,
+                    (code,)
+                )
+                promo = lc.fetchone()
+                lc.execute(
+                    "SELECT 1 FROM users WHERE user_id=?",
+                    (user_id,)
+                )
+                user_exists = lc.fetchone() is not None
+
+                if not user_exists:
+                    error = "Сначала запусти бота командой /start."
+                elif not promo:
+                    error = "Промокод не найден."
+                else:
+                    promo_id, reward_coins, max_uses, uses_count, expires_at, active = promo
+                    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    if not active:
+                        error = "Промокод отключён."
+                    elif expires_at and expires_at <= now:
+                        error = "Срок действия промокода истёк."
+                    else:
+                        lc.execute(
+                            """
+                            SELECT 1 FROM promo_redemptions
+                            WHERE promo_id=? AND user_id=?
+                            """,
+                            (promo_id, user_id)
+                        )
+                        already_used = lc.fetchone() is not None
+                        if already_used:
+                            error = "Ты уже использовал этот промокод."
+                        elif max_uses and uses_count >= max_uses:
+                            error = "Лимит использований промокода исчерпан."
+                        else:
+                            lc.execute(
+                                """
+                                INSERT INTO promo_redemptions (promo_id, user_id)
+                                VALUES (?, ?)
+                                """,
+                                (promo_id, user_id)
+                            )
+                            lc.execute(
+                                """
+                                UPDATE promo_codes
+                                SET uses_count=uses_count+1
+                                WHERE id=?
+                                """,
+                                (promo_id,)
+                            )
+                            lc.execute(
+                                """
+                                UPDATE users
+                                SET coins=COALESCE(coins, 0)+?
+                                WHERE user_id=?
+                                """,
+                                (reward_coins, user_id)
+                            )
+                            db.commit()
+        except sqlite3.IntegrityError:
+            db.rollback()
+            error = "Ты уже использовал этот промокод."
+
+        if error:
+            await message.answer(f"❌ {error}")
+            return
+
+        user_states.pop(user_id, None)
+        kb = InlineKeyboardBuilder()
+        kb.button(text="🛒 Вернуться в магазин", callback_data="shop")
+        await message.answer(
+            f"✅ Промокод применён!\n\n"
+            f"Начислено: {reward_coins} монет.",
+            reply_markup=kb.as_markup()
+        )
         return
 
     if state == "add_reviewer":
