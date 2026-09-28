@@ -1091,14 +1091,11 @@ async def shop_item(callback: CallbackQuery):
             (item_id,)
         )
         item = lc.fetchone()
-        lc.execute("SELECT coins FROM users WHERE user_id=?", (callback.from_user.id,))
-        balance_row = lc.fetchone()
 
     if not item:
         await callback.answer("Товар больше недоступен.", show_alert=True)
         return
 
-    balance = balance_row[0] if balance_row else 0
     item_id, name, description, price = item
     kb = InlineKeyboardBuilder()
     kb.button(text=f"✅ Купить за {price} монет", callback_data=f"shop_buy_{item_id}")
@@ -1107,7 +1104,7 @@ async def shop_item(callback: CallbackQuery):
 
     await callback.message.answer(
         f"🛍 {name}\n\n{description}\n\n"
-        f"Цена: {price} монет\nВаш баланс: {balance} монет",
+        f"Цена: {price} монет",
         reply_markup=kb.as_markup()
     )
     await callback.answer()
