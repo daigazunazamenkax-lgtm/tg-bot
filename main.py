@@ -1,13 +1,16 @@
 import asyncio
 import os
+import re
 import sqlite3
 import random
 import string
+import time
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, ChatJoinRequest
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, ChatJoinRequest, BufferedInputFile
 from aiogram.filters import ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -21,6 +24,13 @@ CHANNEL_LINK = "https://t.me/chapitosikboss"
 CHAT_LINK = "https://t.me/+hi1WWyULprhlMDgx"
 
 ADMINS = [8008667717]
+
+# Сколько раз бот сам снимает ЧС за отписку при повторной подписке (0 - не снимать никогда)
+AUTO_FORGIVE_LIMIT = 1
+
+# Инструкция по установке - показывается в карточке сборки. Пусто = блок не показывается.
+# Можно задать переменной окружения INSTALL_GUIDE
+INSTALL_GUIDE = os.environ.get("INSTALL_GUIDE", "").strip()
 
 bot = Bot(TOKEN)
 dp = Dispatcher()
@@ -232,6 +242,80 @@ CREATE TABLE IF NOT EXISTS promo_redemptions (
 db.commit()
 
 
+# ---------------------------------------------------------------------
+# v2: миграции (все идемпотентны - безопасно запускать при каждом старте)
+# ---------------------------------------------------------------------
+
+def ensure_column(table, column, ddl):
+    existing = [row[1] for row in cursor.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column not in existing:
+        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        db.commit()
+
+
+# users: аналитика, мягкий ЧС, уведомления
+ensure_column("users", "created_at", "TEXT")
+ensure_column("users", "source", "TEXT")
+ensure_column("users", "last_seen", "TEXT")
+ensure_column("users", "bot_blocked", "INTEGER DEFAULT 0")
+ensure_column("users", "ban_reason", "TEXT")
+ensure_column("users", "ban_count", "INTEGER DEFAULT 0")
+ensure_column("users", "notify_builds", "INTEGER")
+ensure_column("users", "notify_asked_at", "TEXT")
+
+# builds: карточка сборки
+ensure_column("builds", "description", "TEXT")
+ensure_column("builds", "photo_id", "TEXT")
+ensure_column("builds", "added_at", "TEXT")
+ensure_column("builds", "notified_at", "TEXT")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS build_votes (
+    build_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    vote INTEGER NOT NULL,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (build_id, user_id)
+)
+""")
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS ban_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    action TEXT NOT NULL,
+    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+
+# Бэкфилл старых данных.
+# created_at у старых пользователей = дата первого скачивания (точной даты регистрации раньше не хранили)
+cursor.execute("""
+UPDATE users
+SET created_at = (SELECT MIN(d.ts) FROM downloads d WHERE d.user_id = users.user_id)
+WHERE created_at IS NULL
+""")
+
+# added_at у старых сборок = дата первого скачивания
+cursor.execute("""
+UPDATE builds
+SET added_at = (SELECT MIN(d.ts) FROM downloads d WHERE d.build_id = builds.id)
+WHERE added_at IS NULL
+""")
+
+# Уже забаненные: те, кто скачивал сборки, считаем автобаном за отписку (первое нарушение),
+# остальных - ручными банами
+cursor.execute("UPDATE users SET ban_count = 1 WHERE blacklisted = 1 AND (ban_count IS NULL OR ban_count = 0)")
+cursor.execute("""
+UPDATE users SET ban_reason = 'auto_leave'
+WHERE blacklisted = 1 AND ban_reason IS NULL
+  AND EXISTS (SELECT 1 FROM downloads d WHERE d.user_id = users.user_id)
+""")
+cursor.execute("UPDATE users SET ban_reason = 'manual' WHERE blacklisted = 1 AND ban_reason IS NULL")
+
+db.commit()
+
+
 async def has_reviewer_access(user_id):
     if user_id in ADMINS:
         return True
@@ -287,6 +371,11 @@ def main_menu(user_id=None):
     )
 
     kb.button(
+        text="🔔 Уведомления о сборках",
+        callback_data="notify_menu"
+    )
+
+    kb.button(
         text="📢 Канал",
         url=CHANNEL_LINK
     )
@@ -334,6 +423,16 @@ def admin_menu():
     kb.button(
         text="⭐ Рекомендуемая",
         callback_data="admin_recommend"
+    )
+
+    kb.button(
+        text="🖼 Карточка сборки",
+        callback_data="admin_card"
+    )
+
+    kb.button(
+        text="🔔 Спросить про уведомления",
+        callback_data="admin_ask_notify"
     )
 
     kb.button(
@@ -524,6 +623,662 @@ async def confirm_referral_if_pending(user_id):
             pass
 
 
+# ======================================================================
+# v2 · аналитика, мягкий ЧС, карточка сборки, уведомления о сборках
+# ======================================================================
+
+def now_utc_str():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_date(ts):
+    try:
+        return datetime.strptime(str(ts)[:10], "%Y-%m-%d").strftime("%d.%m.%Y")
+    except Exception:
+        return ""
+
+
+def short_title(name, limit=48):
+    name = " ".join((name or "").split())
+    if len(name) <= limit:
+        return name
+    return name[: limit - 1].rstrip() + "…"
+
+
+def is_http_url(value):
+    return bool(value) and str(value).strip().lower().startswith(("http://", "https://"))
+
+
+# ---------- last_seen: пишем не чаще раза в 10 минут на пользователя ----------
+
+_last_touch = {}
+TOUCH_INTERVAL = 600
+
+
+class TouchMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        try:
+            user = getattr(event, "from_user", None)
+            if user and not user.is_bot:
+                now = time.monotonic()
+                last = _last_touch.get(user.id)
+                if last is None or now - last > TOUCH_INTERVAL:
+                    _last_touch[user.id] = now
+                    async with db_lock:
+                        db.execute(
+                            "UPDATE users SET last_seen=?, bot_blocked=0 WHERE user_id=?",
+                            (now_utc_str(), user.id)
+                        )
+                        db.commit()
+        except Exception:
+            pass
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(TouchMiddleware())
+dp.callback_query.outer_middleware(TouchMiddleware())
+
+
+@dp.my_chat_member()
+async def on_my_chat_member(event: ChatMemberUpdated):
+    # Пользователь заблокировал бота / разблокировал его
+    if event.chat.type != "private":
+        return
+    blocked = 1 if event.new_chat_member.status in ("kicked", "left") else 0
+    async with db_lock:
+        db.execute("UPDATE users SET bot_blocked=? WHERE user_id=?", (blocked, event.chat.id))
+        db.commit()
+
+
+# ---------- мягкий ЧС: прощаем один раз при повторной подписке ----------
+
+async def try_auto_forgive(user_id):
+    """Снимает ЧС за отписку, если это первое нарушение. True - снят."""
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT blacklisted, ban_reason, ban_count FROM users WHERE user_id=?", (user_id,))
+        row = lc.fetchone()
+        if not row or row[0] != 1 or row[1] != "auto_leave" or (row[2] or 0) > AUTO_FORGIVE_LIMIT:
+            return False
+        lc.execute("UPDATE users SET blacklisted=0 WHERE user_id=? AND blacklisted=1", (user_id,))
+        changed = lc.rowcount > 0
+        if changed:
+            lc.execute("INSERT INTO ban_log (user_id, action) VALUES (?, 'auto_unban')", (user_id,))
+        db.commit()
+    return changed
+
+
+async def blacklist_check(callback):
+    """True - пользователь в ЧС, сообщение ему уже отправлено, дальше идти нельзя."""
+    user_id = callback.from_user.id
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT blacklisted, ban_reason, ban_count FROM users WHERE user_id=?", (user_id,))
+        row = lc.fetchone()
+
+    if not row or row[0] != 1:
+        return False
+
+    reason, count = row[1], (row[2] or 0)
+    can_forgive = reason == "auto_leave" and count <= AUTO_FORGIVE_LIMIT
+
+    # Уже подписался обратно, а событие входа мы не поймали - прощаем сразу
+    if can_forgive and await check_sub(user_id):
+        if await try_auto_forgive(user_id):
+            await callback.message.answer("✅ С возвращением! ЧС снят - сборки снова доступны.")
+            return False
+
+    if can_forgive:
+        await callback.message.answer(
+            "⏸ Доступ к сборкам приостановлен: ты вышел из канала.\n\n"
+            "Подпишись снова - и ЧС снимется автоматически (это работает один раз).",
+            reply_markup=sub_menu()
+        )
+    elif reason == "auto_leave":
+        await callback.message.answer(
+            "❌ Ты повторно вышел из канала, поэтому ЧС не снимается автоматически.\n\n"
+            "Снять его можно в 🛒 Магазине за монеты или через администрацию."
+        )
+    else:
+        await callback.message.answer("❌ Вы в ЧС и не можете скачивать сборки. Обратитесь к администрации.")
+    return True
+
+
+# ---------- карточка сборки ----------
+
+async def get_build_full(build_id):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "SELECT id, name, link, downloads, recommended, description, photo_id, added_at "
+            "FROM builds WHERE id=?",
+            (build_id,)
+        )
+        row = lc.fetchone()
+        if not row:
+            return None
+        lc.execute(
+            "SELECT COALESCE(SUM(vote=1), 0), COALESCE(SUM(vote=-1), 0) FROM build_votes WHERE build_id=?",
+            (build_id,)
+        )
+        likes, dislikes = lc.fetchone()
+    return {
+        "id": row[0], "name": row[1], "link": row[2], "downloads": row[3] or 0,
+        "recommended": row[4], "description": row[5], "photo_id": row[6],
+        "added_at": row[7], "likes": likes, "dislikes": dislikes,
+    }
+
+
+def render_card_text(b, link_in_text=False):
+    lines = [f"🔥 {b['name']}"]
+    if b["description"]:
+        lines += ["", b["description"]]
+    lines.append("")
+    if b["added_at"]:
+        lines.append(f"📅 Добавлена: {fmt_date(b['added_at'])}")
+    lines.append(f"📥 Скачали: {b['downloads']}")
+    if INSTALL_GUIDE:
+        lines += ["", "🛠 Как установить:", INSTALL_GUIDE]
+    if link_in_text or not is_http_url(b["link"]):
+        # ссылка без https:// или такая, которую Telegram не принял как кнопку - показываем текстом
+        lines += ["", "📥 Скачать:", str(b["link"])]
+    text = "\n".join(lines)
+    if b["photo_id"] and len(text) > 1024:
+        text = text[:1020] + "…"
+    return text
+
+
+def card_keyboard(b, with_url=True):
+    kb = InlineKeyboardBuilder()
+    has_link = with_url and is_http_url(b["link"])
+    if has_link:
+        kb.button(text="📥 Скачать", url=str(b["link"]).strip())
+    kb.button(text=f"👍 {b['likes']}" if b["likes"] else "👍", callback_data=f"bvote_{b['id']}_up")
+    kb.button(text=f"👎 {b['dislikes']}" if b["dislikes"] else "👎", callback_data=f"bvote_{b['id']}_down")
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    if has_link:
+        kb.adjust(1, 2, 1)
+    else:
+        kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+async def send_build_card(target_message, b):
+    text = render_card_text(b)
+    kb = card_keyboard(b)
+    if b["photo_id"]:
+        try:
+            await target_message.answer_photo(b["photo_id"], caption=text, reply_markup=kb)
+            return
+        except Exception:
+            pass  # file_id мог протухнуть - покажем карточку текстом
+    try:
+        await target_message.answer(text, reply_markup=kb)
+    except Exception:
+        # Telegram не принял URL-кнопку - отдаём ссылку текстом, чтобы человек точно получил сборку
+        await target_message.answer(
+            render_card_text(b, link_in_text=True),
+            reply_markup=card_keyboard(b, with_url=False)
+        )
+
+
+async def deliver_build(target_message, user_id, build_id):
+    b = await get_build_full(build_id)
+    if not b:
+        await target_message.answer("❌ Сборка не найдена.")
+        return
+    await send_build_card(target_message, b)
+    try:
+        await maybe_offer_notify(target_message, user_id)
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("bvote_"))
+async def build_vote(callback: CallbackQuery):
+    try:
+        _, raw_id, kind = callback.data.split("_")
+        build_id = int(raw_id)
+    except Exception:
+        await callback.answer()
+        return
+
+    vote = 1 if kind == "up" else -1
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT 1 FROM builds WHERE id=?", (build_id,))
+        exists = lc.fetchone() is not None
+        if exists:
+            lc.execute(
+                "INSERT OR REPLACE INTO build_votes (build_id, user_id, vote) VALUES (?, ?, ?)",
+                (build_id, callback.from_user.id, vote)
+            )
+            db.commit()
+
+    if not exists:
+        await callback.answer("Эта сборка уже удалена", show_alert=True)
+        return
+
+    await callback.answer("👍 Спасибо за оценку!" if vote == 1 else "👎 Принято, спасибо!")
+
+    b = await get_build_full(build_id)
+    if b:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=card_keyboard(b))
+        except Exception:
+            pass
+
+
+# ---------- уведомления о новых сборках (opt-in) ----------
+
+def notify_prompt_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔔 Да, сообщай", callback_data="notify_on")
+    kb.button(text="🔕 Не надо", callback_data="notify_off")
+    kb.adjust(2)
+    return kb.as_markup()
+
+
+NOTIFY_PROMPT_TEXT = (
+    "🔔 Сообщать тебе о новых сборках?\n\n"
+    "Пришлю одно короткое сообщение, когда выйдет новая. Выключить можно в любой момент в меню бота."
+)
+
+
+async def maybe_offer_notify(target_message, user_id):
+    """Один раз предлагаем подписаться на уведомления после скачивания."""
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT notify_builds, notify_asked_at FROM users WHERE user_id=?", (user_id,))
+        row = lc.fetchone()
+        if row is None or row[0] is not None or row[1] is not None:
+            return
+        lc.execute("UPDATE users SET notify_asked_at=? WHERE user_id=?", (now_utc_str(), user_id))
+        db.commit()
+    await target_message.answer(NOTIFY_PROMPT_TEXT, reply_markup=notify_prompt_kb())
+
+
+@dp.callback_query(F.data.startswith("notify_"))
+async def notify_callbacks(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    action = callback.data
+
+    back_kb = InlineKeyboardBuilder()
+    back_kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    back_kb.adjust(1)
+
+    if action in ("notify_on", "notify_off"):
+        value = 1 if action == "notify_on" else 0
+        async with db_lock:
+            db.execute(
+                "UPDATE users SET notify_builds=?, notify_asked_at=COALESCE(notify_asked_at, ?) WHERE user_id=?",
+                (value, now_utc_str(), user_id)
+            )
+            db.commit()
+        text = (
+            "🔔 Готово! Напишу, когда выйдет новая сборка."
+            if value else
+            "🔕 Ок, уведомления выключены. Включить обратно можно в меню бота."
+        )
+        await callback.answer()
+        try:
+            await callback.message.edit_text(text, reply_markup=back_kb.as_markup())
+        except Exception:
+            await callback.message.answer(text, reply_markup=back_kb.as_markup())
+        return
+
+    if action == "notify_menu":
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute("SELECT notify_builds FROM users WHERE user_id=?", (user_id,))
+            row = lc.fetchone()
+        state = row[0] if row else None
+        status = "включены 🔔" if state == 1 else "выключены 🔕"
+        kb = InlineKeyboardBuilder()
+        if state == 1:
+            kb.button(text="🔕 Выключить", callback_data="notify_off")
+        else:
+            kb.button(text="🔔 Включить", callback_data="notify_on")
+        kb.button(text="🔙 Главное меню", callback_data="main_menu")
+        kb.adjust(1)
+        await callback.answer()
+        await callback.message.answer(
+            f"Уведомления о новых сборках сейчас {status}.",
+            reply_markup=kb.as_markup()
+        )
+        return
+
+    await callback.answer()
+
+
+# ---------- рассылки: сегменты и безопасная отправка ----------
+
+SEGMENTS = {
+    "all": (
+        "👥 Все (кроме заблокировавших бота)",
+        "COALESCE(bot_blocked,0)=0"
+    ),
+    "active": (
+        "✅ Все, кто не в ЧС",
+        "COALESCE(bot_blocked,0)=0 AND COALESCE(blacklisted,0)=0"
+    ),
+    "notify": (
+        "🔔 Подписанные на новые сборки",
+        "COALESCE(bot_blocked,0)=0 AND COALESCE(blacklisted,0)=0 AND notify_builds=1"
+    ),
+    "banned": (
+        "🚫 Только в ЧС",
+        "COALESCE(bot_blocked,0)=0 AND blacklisted=1"
+    ),
+    "idle14": (
+        "😴 Скачивали, но не заходили 14+ дней",
+        "COALESCE(bot_blocked,0)=0 AND COALESCE(blacklisted,0)=0 "
+        "AND user_id IN (SELECT user_id FROM downloads GROUP BY user_id HAVING MAX(ts) < datetime('now','-14 days')) "
+        "AND (last_seen IS NULL OR last_seen < datetime('now','-14 days'))"
+    ),
+}
+
+# кому ещё не предлагали уведомления
+ASK_NOTIFY_WHERE = (
+    "COALESCE(bot_blocked,0)=0 AND COALESCE(blacklisted,0)=0 "
+    "AND notify_builds IS NULL AND notify_asked_at IS NULL"
+)
+
+BROADCAST_DELAY = 0.05  # ~20 сообщений/сек, лимит Telegram около 30
+
+background_tasks = set()
+
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
+
+async def get_ids_where(where):
+    # where приходит только из констант выше, не от пользователя
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(f"SELECT user_id FROM users WHERE {where}")
+        return [row[0] for row in lc.fetchall()]
+
+
+async def count_where(where):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(f"SELECT COUNT(*) FROM users WHERE {where}")
+        return lc.fetchone()[0]
+
+
+async def safe_send(user_id, text, photo=None, reply_markup=None, parse_mode="HTML"):
+    """Возвращает (статус, ошибка): ok / blocked / error."""
+    for _ in range(3):
+        try:
+            if photo:
+                await bot.send_photo(
+                    user_id, photo=photo, caption=text or None,
+                    parse_mode=parse_mode, reply_markup=reply_markup
+                )
+            else:
+                await bot.send_message(
+                    user_id, text, parse_mode=parse_mode, reply_markup=reply_markup
+                )
+            return "ok", None
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after + 1)
+        except TelegramForbiddenError:
+            return "blocked", None
+        except TelegramBadRequest as e:
+            if "chat not found" in str(e).lower():
+                return "blocked", None
+            return "error", str(e)[:200]
+        except Exception as e:
+            return "error", str(e)[:200]
+    return "error", "лимит Telegram, 3 попытки"
+
+
+async def run_broadcast(admin_id, user_ids, text, photo=None, reply_markup=None, parse_mode="HTML"):
+    sent = blocked = failed = 0
+    blocked_ids = []
+    first_error = None
+    started = time.monotonic()
+
+    for uid in user_ids:
+        status, err = await safe_send(uid, text, photo, reply_markup, parse_mode)
+        if status == "ok":
+            sent += 1
+        elif status == "blocked":
+            blocked += 1
+            blocked_ids.append(uid)
+        else:
+            failed += 1
+            if first_error is None:
+                first_error = err
+        await asyncio.sleep(BROADCAST_DELAY)
+
+    if blocked_ids:
+        async with db_lock:
+            db.executemany("UPDATE users SET bot_blocked=1 WHERE user_id=?", [(i,) for i in blocked_ids])
+            db.commit()
+
+    report = (
+        "✅ Рассылка завершена\n\n"
+        f"📨 Доставлено: {sent}\n"
+        f"📵 Заблокировали бота: {blocked}\n"
+        f"⚠️ Ошибки: {failed}\n"
+        f"⏱ Время: {int(time.monotonic() - started)} сек"
+    )
+    if first_error:
+        report += f"\n\nПервая ошибка: {first_error}"
+    try:
+        await bot.send_message(admin_id, report)
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("admin_bc_"))
+async def admin_broadcast_segment(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    key = callback.data[len("admin_bc_"):]
+    if key not in SEGMENTS:
+        await callback.answer("Неизвестный сегмент", show_alert=True)
+        return
+
+    user_states[callback.from_user.id] = "broadcast"
+    user_temp[callback.from_user.id] = {"segment": key}
+
+    await callback.answer()
+    await callback.message.answer(
+        f"📢 Сегмент: {SEGMENTS[key][0]}\n\n"
+        "Отправь текст рассылки.\n"
+        "Форматирование (жирный, ссылки) сохранится. Можно отправить фото с подписью."
+    )
+
+
+@dp.callback_query(F.data == "admin_ask_notify")
+async def admin_ask_notify(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    n = await count_where(ASK_NOTIFY_WHERE)
+    await callback.answer()
+
+    if n == 0:
+        await callback.message.answer("Некому отправлять: всем уже предлагали уведомления.")
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"✅ Отправить {n} чел.", callback_data="admin_ask_notify_go")
+    kb.button(text="Отмена", callback_data="admin_cancel")
+    kb.adjust(1)
+    await callback.message.answer(
+        "🔔 Разовый вопрос «Сообщать о новых сборках?» с кнопками Да / Не надо.\n\n"
+        f"Получат: {n} чел. (без ЧС и без заблокировавших бота, кому ещё не предлагали).",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "admin_ask_notify_go")
+async def admin_ask_notify_go(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    # читаем и помечаем под одним локом, чтобы повторное нажатие ничего не отправило
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(f"SELECT user_id FROM users WHERE {ASK_NOTIFY_WHERE}")
+        ids = [row[0] for row in lc.fetchall()]
+        if ids:
+            lc.executemany(
+                "UPDATE users SET notify_asked_at=? WHERE user_id=?",
+                [(now_utc_str(), i) for i in ids]
+            )
+            db.commit()
+
+    await callback.answer()
+
+    if not ids:
+        await callback.message.answer("Некому отправлять.")
+        return
+
+    await callback.message.answer(f"🚀 Отправляю вопрос {len(ids)} чел. Отчёт пришлю по завершении.")
+    spawn(run_broadcast(
+        callback.from_user.id, ids, NOTIFY_PROMPT_TEXT,
+        reply_markup=notify_prompt_kb(), parse_mode=None
+    ))
+
+
+@dp.callback_query(F.data.startswith("admin_notify_build_"))
+async def admin_notify_build(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        build_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer()
+        return
+
+    b = await get_build_full(build_id)
+    if not b:
+        await callback.answer("Сборка не найдена", show_alert=True)
+        return
+
+    # атомарно «занимаем» отправку - по одной сборке рассылка уходит только один раз
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "UPDATE builds SET notified_at=? WHERE id=? AND notified_at IS NULL",
+            (now_utc_str(), build_id)
+        )
+        claimed = lc.rowcount > 0
+        db.commit()
+
+    if not claimed:
+        await callback.answer("По этой сборке рассылка уже отправлялась", show_alert=True)
+        return
+
+    ids = await get_ids_where(SEGMENTS["notify"][1])
+    await callback.answer()
+
+    text = f"🔥 Вышла новая сборка!\n\n{b['name']}"
+    if b["description"]:
+        text += f"\n\n{b['description'][:300]}"
+    text += "\n\nЖми кнопку 👇\n(отключить уведомления можно в меню бота)"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📥 Получить сборку", callback_data=f"build_{build_id}")
+    kb.adjust(1)
+
+    await callback.message.answer(f"🚀 Рассылка о сборке запущена: {len(ids)} чел. Отчёт пришлю по завершении.")
+    spawn(run_broadcast(
+        callback.from_user.id, ids, text,
+        photo=b["photo_id"], reply_markup=kb.as_markup(), parse_mode=None
+    ))
+
+
+# ---------- админ: карточка сборки (скриншот + описание) ----------
+
+@dp.callback_query(F.data == "admin_card")
+async def admin_card(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, name, photo_id, description FROM builds ORDER BY id DESC")
+        rows = lc.fetchall()
+
+    await callback.answer()
+
+    if not rows:
+        await callback.message.answer("❌ Сборок пока нет.")
+        return
+
+    user_states[callback.from_user.id] = "card_pick"
+
+    text = "🖼 У какой сборки обновить карточку?\n\n"
+    for r in rows:
+        marks = ("🖼" if r[2] else "▫️") + ("📝" if r[3] else "▫️")
+        text += f"{r[0]} | {marks} | {short_title(r[1], 40)}\n"
+    text += "\n🖼 = есть скриншот, 📝 = есть описание\n\nОтправь ID сборки"
+
+    await callback.message.answer(text[:4000])
+
+
+@dp.callback_query(F.data.startswith("admin_card_"))
+async def admin_card_for_build(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        build_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer()
+        return
+
+    user_temp[callback.from_user.id] = {"build_id": build_id}
+    user_states[callback.from_user.id] = "card_content"
+
+    await callback.answer()
+    await callback.message.answer(CARD_CONTENT_PROMPT)
+
+
+CARD_CONTENT_PROMPT = (
+    "Пришли скриншот с подписью - подпись станет описанием.\n"
+    "Или просто текст - он станет описанием.\n\n"
+    "Чтобы очистить скриншот и описание - отправь «-»."
+)
+
+
+# ---------- админ: метки источников ----------
+
+@dp.message(F.text.startswith("/admin_link"))
+async def admin_link(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+
+    parts = message.text.split(maxsplit=1)
+    tag = re.sub(r"[^A-Za-z0-9_\-]", "", parts[1].strip())[:40] if len(parts) > 1 else ""
+
+    if not tag:
+        await message.answer(
+            "🔗 Ссылка с меткой источника.\n\n"
+            "Использование: /admin_link <метка>\n"
+            "Примеры: /admin_link yt_video12, /admin_link chat_rodina, /admin_link tiktok1\n\n"
+            "Метка: латиница, цифры, _ и -. Источники смотри в 📊 Статистике."
+        )
+        return
+
+    me = await bot.get_me()
+    await message.answer(f"🔗 Ссылка для метки «{tag}»:\n\nhttps://t.me/{me.username}?start=src_{tag}")
+
+
 @dp.message(F.text.startswith("/start"))
 async def start(message: Message):
 
@@ -535,9 +1290,19 @@ async def start(message: Message):
         cursor.execute("SELECT user_id FROM users WHERE user_id=?", (message.from_user.id,))
         is_new_user = cursor.fetchone() is None
 
+        # Источник: src_<метка> из ссылки, "ref" для рефералок, "direct" без параметра
+        source_val = None
+        if is_new_user:
+            if param and param.startswith("src_"):
+                source_val = re.sub(r"[^A-Za-z0-9_\-]", "", param[4:])[:40] or "direct"
+            elif param:
+                source_val = "ref"
+            else:
+                source_val = "direct"
+
         cursor.execute(
-            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
-            (message.from_user.id,)
+            "INSERT OR IGNORE INTO users (user_id, created_at, source, last_seen) VALUES (?, ?, ?, ?)",
+            (message.from_user.id, now_utc_str(), source_val, now_utc_str())
         )
         db.commit()
 
@@ -559,7 +1324,7 @@ async def start(message: Message):
                     referrer_id = int(param[4:])
                 except Exception:
                     referrer_id = None
-            else:
+            elif not param.startswith("src_"):
                 cursor.execute("SELECT user_id FROM users WHERE ref_code=?", (param,))
                 ref = cursor.fetchone()
                 if ref:
@@ -747,7 +1512,14 @@ async def admin_banlist(message: Message):
     for row in rows:
         text += f"• {row[0]}\n"
 
-    await message.answer(text)
+    if len(text) <= 4000:
+        await message.answer(text)
+    else:
+        data = "\n".join(str(row[0]) for row in rows).encode("utf-8")
+        await message.answer_document(
+            BufferedInputFile(data, filename="banlist.txt"),
+            caption=f"🚫 Чёрный список: {len(rows)} чел."
+        )
 
 
 @dp.message(F.text.startswith("/admin_ban"))
@@ -764,7 +1536,7 @@ async def admin_ban(message: Message):
 
     async with db_lock:
         cursor.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (target_id,))
-        cursor.execute("UPDATE users SET blacklisted=1 WHERE user_id=? AND (blacklisted IS NULL OR blacklisted=0)", (target_id,))
+        cursor.execute("UPDATE users SET blacklisted=1, ban_reason='manual' WHERE user_id=? AND (blacklisted IS NULL OR blacklisted=0)", (target_id,))
         already_banned = cursor.rowcount == 0
         db.commit()
 
@@ -821,14 +1593,8 @@ async def builds(callback: CallbackQuery):
 
     user_id = callback.from_user.id
 
-    # Проверяем ЧС
-    async with db_lock:
-        lc = db.cursor()
-        lc.execute("SELECT blacklisted FROM users WHERE user_id=?", (user_id,))
-        bl_row = lc.fetchone()
-
-    if bl_row and bl_row[0] == 1:
-        await callback.message.answer("❌ Вы в ЧС и не можете скачивать сборки. Обратитесь к администрации.")
+    # Проверяем ЧС (мягкий: однократное прощение при повторной подписке)
+    if await blacklist_check(callback):
         return
 
     # Проверяем подписку перед показом списка
@@ -838,7 +1604,7 @@ async def builds(callback: CallbackQuery):
 
     async with db_lock:
         lc = db.cursor()
-        lc.execute("SELECT * FROM builds")
+        lc.execute("SELECT * FROM builds ORDER BY id DESC")
         builds_list = lc.fetchall()
         lc.execute("SELECT * FROM builds WHERE recommended=1 LIMIT 1")
         recommended_build = lc.fetchone()
@@ -856,7 +1622,7 @@ async def builds(callback: CallbackQuery):
     for build in builds_list:
 
         kb.button(
-            text=f"🔥 {build[1]}{' ⭐' if len(build) > 4 and build[4] == 1 else ''}",
+            text=f"🔥 {short_title(build[1])}{' ⭐' if len(build) > 4 and build[4] == 1 else ''}",
             callback_data=f"build_{build[0]}"
         )
 
@@ -1296,16 +2062,8 @@ async def build(callback: CallbackQuery):
     )
     user_id = callback.from_user.id
 
-    # 1. Читаем статус ЧС до любых await
-    async with db_lock:
-        lc = db.cursor()
-        lc.execute("SELECT blacklisted FROM users WHERE user_id=?", (user_id,))
-        bl_row = lc.fetchone()
-
-    if bl_row and bl_row[0] == 1:
-        await callback.message.answer(
-            "❌ Вы в ЧС и не можете скачивать сборки. Обратитесь к администрации."
-        )
+    # 1. ЧС (мягкий: однократное прощение при повторной подписке)
+    if await blacklist_check(callback):
         return
 
     # 2. Проверяем подписку (await)
@@ -1347,18 +2105,7 @@ async def build(callback: CallbackQuery):
         await callback.message.answer("❌ Сборка не найдена.")
         return
 
-    text = f"""
-🔥 {build_row[1]}
-
-📥 Скачать:
-{build_row[2]}
-"""
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔙 Главное меню", callback_data="main_menu")
-    kb.adjust(1)
-
-    await callback.message.answer(text, reply_markup=kb.as_markup())
+    await deliver_build(callback.message, user_id, build_id)
 
 
 @dp.callback_query(F.data == "check_sub")
@@ -1419,11 +2166,7 @@ async def check_sponsor_sub(callback: CallbackQuery):
         await callback.message.answer("❌ Сборка не найдена.")
         return
 
-    text = f"🔥 {build_row[1]}\n\n📥 Скачать:\n{build_row[2]}"
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🔙 Главное меню", callback_data="main_menu")
-    kb.adjust(1)
-    await callback.message.answer(text, reply_markup=kb.as_markup())
+    await deliver_build(callback.message, user_id, build_id)
 
 
 @dp.callback_query(F.data == "admin_sponsors")
@@ -2133,7 +2876,7 @@ async def admin_add(callback: CallbackQuery):
     user_states[callback.from_user.id] = "add"
 
     await callback.message.answer(
-        "📦 Отправь:\nНазвание|Ссылка"
+        "📦 Отправь:\nНазвание|Ссылка|Описание\n\nОписание необязательно. Скриншот можно добавить после - кнопкой «🖼 Карточка сборки».\nСсылка должна начинаться с https://"
     )
 
 
@@ -2168,22 +2911,57 @@ async def admin_stats(callback: CallbackQuery):
 
     async with db_lock:
         lc = db.cursor()
+
+        def q1(sql):
+            lc.execute(sql)
+            return lc.fetchone()[0]
+
         lc.execute("SELECT * FROM builds")
         builds_list = lc.fetchall()
-        lc.execute("SELECT COUNT(*) FROM users")
-        total_users = lc.fetchone()[0]
+        total_users = q1("SELECT COUNT(*) FROM users")
+        new_today = q1("SELECT COUNT(*) FROM users WHERE created_at >= date('now')")
+        new_7d = q1("SELECT COUNT(*) FROM users WHERE created_at >= datetime('now','-7 days')")
+        new_30d = q1("SELECT COUNT(*) FROM users WHERE created_at >= datetime('now','-30 days')")
+        active_7d = q1("SELECT COUNT(*) FROM users WHERE last_seen >= datetime('now','-7 days')")
+        banned_total = q1("SELECT COUNT(*) FROM users WHERE blacklisted=1")
+        banned_auto = q1("SELECT COUNT(*) FROM users WHERE blacklisted=1 AND ban_reason='auto_leave'")
+        forgiven = q1("SELECT COUNT(*) FROM ban_log WHERE action='auto_unban'")
+        blocked_bot = q1("SELECT COUNT(*) FROM users WHERE bot_blocked=1")
+        notify_on = q1("SELECT COUNT(*) FROM users WHERE notify_builds=1")
+        lc.execute(
+            "SELECT COALESCE(u.source, 'до трекинга'), COUNT(*), "
+            "SUM(EXISTS(SELECT 1 FROM downloads d WHERE d.user_id=u.user_id)) "
+            "FROM users u GROUP BY 1 ORDER BY 2 DESC LIMIT 12"
+        )
+        sources = lc.fetchall()
 
-    text = f"📊 Статистика\n\nПользователей: {total_users}\n\n"
+    text = (
+        "📊 Статистика\n\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"🆕 Новых: сегодня {new_today} · 7 дн. {new_7d} · 30 дн. {new_30d}\n"
+        "(у старых пользователей дата = первое скачивание)\n"
+        f"🔥 Заходили за 7 дней: {active_7d} (счётчик ведётся с момента обновления)\n"
+        f"🚫 В ЧС: {banned_total} (за отписку {banned_auto}, вручную {banned_total - banned_auto})\n"
+        f"♻️ Прощено автоматически: {forgiven}\n"
+        f"📵 Заблокировали бота: {blocked_bot}\n"
+        f"🔔 Хотят уведомления о сборках: {notify_on}\n\n"
+        "📍 Источники (пришло / скачали):\n"
+    )
+
+    for src_name, total, downloaded in sources:
+        text += f"• {src_name} - {total} / {downloaded or 0}\n"
+
+    text += "\n📦 Сборки:\n"
 
     for b in builds_list:
 
         text += (
             f"{b[0]} | "
-            f"{b[1]} - "
-            f"{b[3]} скачиваний\n"
+            f"{short_title(b[1], 40)} - "
+            f"{b[3]} скач.\n"
         )
 
-    await callback.message.answer(text)
+    await callback.message.answer(text[:4000])
 
 
 @dp.callback_query(F.data == "admin_broadcast")
@@ -2192,13 +2970,15 @@ async def admin_broadcast(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
 
-    user_states[callback.from_user.id] = "broadcast"
+    kb = InlineKeyboardBuilder()
+    for key, (title, where) in SEGMENTS.items():
+        n = await count_where(where)
+        kb.button(text=f"{title} - {n}", callback_data=f"admin_bc_{key}")
+    kb.button(text="Отмена", callback_data="admin_cancel")
+    kb.adjust(1)
 
-    await callback.message.answer(
-        "📢 Отправь текст рассылки\n\n"
-        "Можно с форматированием (жирный, ссылки и т.д.) - сохранится.\n"
-        "Можно отправить фото с подписью - разошлю с картинкой."
-    )
+    await callback.answer()
+    await callback.message.answer("📢 Кому отправить рассылку?", reply_markup=kb.as_markup())
 
 
 @dp.callback_query(F.data == "admin_reward")
@@ -2249,10 +3029,13 @@ async def admin_amnesty(callback: CallbackQuery):
         user_states.pop(callback.from_user.id, None)
         return
 
-    text = "🔒 Чёрный список:\n\n"
+    text = f"🔒 Чёрный список ({len(rows)} чел.):\n\n"
 
-    for r in rows:
+    for r in rows[:40]:
         text += f"{r[0]}\n"
+
+    if len(rows) > 40:
+        text += f"... и ещё {len(rows) - 40} (полный список: /admin_banlist)\n"
 
     text += "\nОтправь ID для снятия с ЧС"
 
@@ -2779,6 +3562,62 @@ async def handle_text(message: Message):
             await message.answer("❌ ID должен быть положительным числом.")
         return
 
+    if state == "card_pick":
+        try:
+            build_id = int((message.text or "").strip())
+        except ValueError:
+            await message.answer("❌ Нужен числовой ID сборки. Или нажми «Отмена» в админке.")
+            return
+
+        async with db_lock:
+            lc = db.cursor()
+            lc.execute("SELECT 1 FROM builds WHERE id=?", (build_id,))
+            found = lc.fetchone() is not None
+
+        if not found:
+            await message.answer("❌ Сборки с таким ID нет. Отправь другой ID.")
+            return
+
+        user_temp[user_id] = {"build_id": build_id}
+        user_states[user_id] = "card_content"
+        await message.answer(CARD_CONTENT_PROMPT)
+        return
+
+    if state == "card_content":
+        build_id = (user_temp.get(user_id) or {}).get("build_id")
+        photo_id = message.photo[-1].file_id if message.photo else None
+        text_in = ((message.caption if message.photo else message.text) or "").strip()
+
+        if not build_id:
+            user_states.pop(user_id, None)
+            user_temp.pop(user_id, None)
+            await message.answer("❌ Сессия потерялась (бот перезапускался). Начни заново: 🖼 Карточка сборки.")
+            return
+
+        if not text_in and not photo_id:
+            await message.answer("❌ Пришли скриншот, текст описания или «-» для очистки.")
+            return
+
+        async with db_lock:
+            lc = db.cursor()
+            if text_in == "-":
+                lc.execute("UPDATE builds SET description=NULL, photo_id=NULL WHERE id=?", (build_id,))
+            else:
+                if text_in:
+                    lc.execute("UPDATE builds SET description=? WHERE id=?", (text_in[:700], build_id))
+                if photo_id:
+                    lc.execute("UPDATE builds SET photo_id=? WHERE id=?", (photo_id, build_id))
+            db.commit()
+
+        user_states.pop(user_id, None)
+        user_temp.pop(user_id, None)
+
+        await message.answer("✅ Карточка обновлена. Так её увидят пользователи:")
+        b = await get_build_full(build_id)
+        if b:
+            await send_build_card(message, b)
+        return
+
     if state == "add":
 
         try:
@@ -2786,24 +3625,37 @@ async def handle_text(message: Message):
             data = message.text.split("|")
 
             if len(data) < 2:
-                await message.answer("❌ Формат: Название|Ссылка")
+                await message.answer("❌ Формат: Название|Ссылка|Описание (описание необязательно)")
                 return
 
             name = data[0].strip()
             link = data[1].strip()
+            description = "|".join(data[2:]).strip()[:700] if len(data) > 2 else ""
 
             async with db_lock:
                 lc = db.cursor()
                 lc.execute(
-                    "INSERT INTO builds (name, link) VALUES (?, ?)",
-                    (name, link)
+                    "INSERT INTO builds (name, link, description, added_at) VALUES (?, ?, ?, ?)",
+                    (name, link, description or None, now_utc_str())
                 )
+                new_build_id = lc.lastrowid
                 db.commit()
 
             user_states.pop(user_id, None)
 
+            subscribers = await count_where(SEGMENTS["notify"][1])
+
+            kb = InlineKeyboardBuilder()
+            kb.button(text=f"📣 Уведомить подписчиков ({subscribers})", callback_data=f"admin_notify_build_{new_build_id}")
+            kb.button(text="🖼 Добавить скриншот / описание", callback_data=f"admin_card_{new_build_id}")
+            kb.adjust(1)
+
+            warn = "" if is_http_url(link) else "\n\n⚠️ Ссылка не начинается с https:// - кнопка «Скачать» работать не будет, покажу ссылку текстом."
+
             await message.answer(
-                f"✅ Сборка добавлена: {name}"
+                f"✅ Сборка добавлена: {name} (ID {new_build_id}){warn}\n\n"
+                "Хочешь оформить карточку и сообщить подписчикам?",
+                reply_markup=kb.as_markup()
             )
 
         except Exception as e:
@@ -2873,45 +3725,28 @@ async def handle_text(message: Message):
 
     elif state == "broadcast":
 
-        async with db_lock:
-            lc = db.cursor()
-            lc.execute("SELECT user_id FROM users")
-            users = lc.fetchall()
-
-        success = 0
+        segment = (user_temp.get(user_id) or {}).get("segment", "all")
+        if segment not in SEGMENTS:
+            segment = "all"
 
         photo_id = message.photo[-1].file_id if message.photo else None
         html_content = message.html_text or ""
 
-        for user in users:
+        if not html_content and not photo_id:
+            await message.answer("❌ Пустое сообщение - отправь текст или фото с подписью.")
+            return
 
-            try:
-
-                if photo_id:
-                    await bot.send_photo(
-                        user[0],
-                        photo=photo_id,
-                        caption=html_content,
-                        parse_mode="HTML"
-                    )
-                else:
-                    await bot.send_message(
-                        user[0],
-                        html_content,
-                        parse_mode="HTML"
-                    )
-
-                success += 1
-
-            except:
-                pass
+        user_ids = await get_ids_where(SEGMENTS[segment][1])
 
         user_states.pop(user_id, None)
+        user_temp.pop(user_id, None)
 
         await message.answer(
-            f"✅ Рассылка завершена\n"
-            f"📨 Отправлено: {success}"
+            f"🚀 Рассылка запущена: {len(user_ids)} чел. ({SEGMENTS[segment][0]}).\n"
+            "Отчёт пришлю, когда закончу - бот пока работает как обычно."
         )
+
+        spawn(run_broadcast(user_id, user_ids, html_content, photo_id))
 
         return
 
@@ -3184,6 +4019,17 @@ async def on_user_join_channel(event: ChatMemberUpdated):
     user_id = event.new_chat_member.user.id
     await confirm_referral_if_pending(user_id)
 
+    if await try_auto_forgive(user_id):
+        try:
+            await bot.send_message(
+                user_id,
+                "✅ С возвращением! ЧС снят - сборки снова доступны.\n\n"
+                "⚠️ Это разовое прощение: если выйти из канала ещё раз, ЧС останется.",
+                reply_markup=main_menu(user_id)
+            )
+        except Exception:
+            pass
+
 
 @dp.chat_member(ChatMemberUpdatedFilter(LEAVE_TRANSITION))
 async def on_user_leave_channel(event: ChatMemberUpdated):
@@ -3195,6 +4041,7 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
     referrer_id = None
     cnt = 0
     was_banned = False
+    ban_count = 0
 
     async with db_lock:
         lc = db.cursor()
@@ -3204,8 +4051,16 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
         had_downloads = lc.fetchone()
         if had_downloads:
             lc.execute("INSERT OR IGNORE INTO users (user_id) VALUES (?)", (user_id,))
-            lc.execute("UPDATE users SET blacklisted=1 WHERE user_id=? AND (blacklisted IS NULL OR blacklisted=0)", (user_id,))
+            lc.execute(
+                "UPDATE users SET blacklisted=1, ban_reason='auto_leave', ban_count=COALESCE(ban_count,0)+1 "
+                "WHERE user_id=? AND (blacklisted IS NULL OR blacklisted=0)",
+                (user_id,)
+            )
             was_banned = lc.rowcount > 0
+            if was_banned:
+                lc.execute("INSERT INTO ban_log (user_id, action) VALUES (?, 'auto_ban')", (user_id,))
+                lc.execute("SELECT ban_count FROM users WHERE user_id=?", (user_id,))
+                ban_count = lc.fetchone()[0] or 0
             db.commit()
 
         # Аннулируем реферал если был
@@ -3224,7 +4079,19 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
 
     if was_banned:
         try:
-            await bot.send_message(user_id, "❌ Вы отписались от канала и добавлены в чёрный список бота.")
+            if ban_count <= AUTO_FORGIVE_LIMIT:
+                await bot.send_message(
+                    user_id,
+                    "⏸ Ты вышел из канала - доступ к сборкам приостановлен.\n\n"
+                    "Подпишись снова - и ЧС снимется автоматически (это работает один раз).",
+                    reply_markup=sub_menu()
+                )
+            else:
+                await bot.send_message(
+                    user_id,
+                    "❌ Ты повторно вышел из канала и добавлен в чёрный список бота.\n\n"
+                    "Снять ЧС можно в 🛒 Магазине за монеты или через администрацию."
+                )
         except Exception:
             pass
 
@@ -3252,7 +4119,8 @@ async def main():
                 "message",
                 "callback_query",
                 "chat_member",
-                "chat_join_request"
+                "chat_join_request",
+                "my_chat_member"
             ]
         ),
         daily_backup()
