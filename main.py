@@ -5,6 +5,7 @@ import sqlite3
 import random
 import string
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
 
@@ -268,6 +269,9 @@ ensure_column("builds", "description", "TEXT")
 ensure_column("builds", "photo_id", "TEXT")
 ensure_column("builds", "added_at", "TEXT")
 ensure_column("builds", "notified_at", "TEXT")
+ensure_column("builds", "posted_at", "TEXT")
+ensure_column("builds", "channel_post_id", "INTEGER")
+ensure_column("users", "pending_build", "INTEGER")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS build_votes (
@@ -428,6 +432,11 @@ def admin_menu():
     kb.button(
         text="🖼 Карточка сборки",
         callback_data="admin_card"
+    )
+
+    kb.button(
+        text="📢 Пост в канал",
+        callback_data="admin_pub"
     )
 
     kb.button(
@@ -824,6 +833,7 @@ async def send_build_card(target_message, b):
 
 
 async def deliver_build(target_message, user_id, build_id):
+    await clear_pending_build(user_id)
     b = await get_build_full(build_id)
     if not b:
         await target_message.answer("❌ Сборка не найдена.")
@@ -1153,55 +1163,6 @@ async def admin_ask_notify_go(callback: CallbackQuery):
     ))
 
 
-@dp.callback_query(F.data.startswith("admin_notify_build_"))
-async def admin_notify_build(callback: CallbackQuery):
-    if callback.from_user.id not in ADMINS:
-        return
-
-    try:
-        build_id = int(callback.data.rsplit("_", 1)[1])
-    except ValueError:
-        await callback.answer()
-        return
-
-    b = await get_build_full(build_id)
-    if not b:
-        await callback.answer("Сборка не найдена", show_alert=True)
-        return
-
-    # атомарно «занимаем» отправку - по одной сборке рассылка уходит только один раз
-    async with db_lock:
-        lc = db.cursor()
-        lc.execute(
-            "UPDATE builds SET notified_at=? WHERE id=? AND notified_at IS NULL",
-            (now_utc_str(), build_id)
-        )
-        claimed = lc.rowcount > 0
-        db.commit()
-
-    if not claimed:
-        await callback.answer("По этой сборке рассылка уже отправлялась", show_alert=True)
-        return
-
-    ids = await get_ids_where(SEGMENTS["notify"][1])
-    await callback.answer()
-
-    text = f"🔥 Вышла новая сборка!\n\n{b['name']}"
-    if b["description"]:
-        text += f"\n\n{b['description'][:300]}"
-    text += "\n\nЖми кнопку 👇\n(отключить уведомления можно в меню бота)"
-
-    kb = InlineKeyboardBuilder()
-    kb.button(text="📥 Получить сборку", callback_data=f"build_{build_id}")
-    kb.adjust(1)
-
-    await callback.message.answer(f"🚀 Рассылка о сборке запущена: {len(ids)} чел. Отчёт пришлю по завершении.")
-    spawn(run_broadcast(
-        callback.from_user.id, ids, text,
-        photo=b["photo_id"], reply_markup=kb.as_markup(), parse_mode=None
-    ))
-
-
 # ---------- админ: карточка сборки (скриншот + описание) ----------
 
 @dp.callback_query(F.data == "admin_card")
@@ -1263,20 +1224,352 @@ async def admin_link(message: Message):
     if message.from_user.id not in ADMINS:
         return
 
-    parts = message.text.split(maxsplit=1)
-    tag = re.sub(r"[^A-Za-z0-9_\-]", "", parts[1].strip())[:40] if len(parts) > 1 else ""
+    parts = message.text.split()
+    tag = clean_tag(parts[1]) if len(parts) > 1 else ""
 
     if not tag:
         await message.answer(
-            "🔗 Ссылка с меткой источника.\n\n"
-            "Использование: /admin_link <метка>\n"
-            "Примеры: /admin_link yt_video12, /admin_link chat_rodina, /admin_link tiktok1\n\n"
+            "🔗 Ссылки с меткой источника.\n\n"
+            "Просто в бота:\n/admin_link <метка>\n"
+            "Сразу на сборку:\n/admin_link <метка> <ID сборки>\n\n"
+            "Примеры:\n/admin_link yt_video12\n/admin_link yt_video12 7\n/admin_link chat_rodina 10\n\n"
             "Метка: латиница, цифры, _ и -. Источники смотри в 📊 Статистике."
         )
         return
 
-    me = await bot.get_me()
-    await message.answer(f"🔗 Ссылка для метки «{tag}»:\n\nhttps://t.me/{me.username}?start=src_{tag}")
+    build_id = None
+    if len(parts) > 2:
+        if not parts[2].isdigit():
+            await message.answer("❌ ID сборки должен быть числом. Пример: /admin_link yt_video12 7")
+            return
+        build_id = int(parts[2])
+        found = await get_build_full(build_id)
+        if not found:
+            await message.answer(f"❌ Сборки с ID {build_id} нет.")
+            return
+
+    if build_id:
+        link = await build_deeplink(build_id, tag)
+        await message.answer(
+            f"🔗 Ссылка на сборку {build_id} (метка «{tag}»):\n\n{link}\n\n"
+            "Открывает карточку сразу, без меню."
+        )
+    else:
+        username = await get_bot_username()
+        await message.answer(f"🔗 Ссылка для метки «{tag}»:\n\nhttps://t.me/{username}?start=src_{tag}")
+
+
+# ======================================================================
+# v3 · прямые ссылки на сборки и публикация сборки в канал
+# ======================================================================
+
+def clean_tag(raw):
+    return re.sub(r"[^A-Za-z0-9_\-]", "", raw or "")[:40]
+
+
+def clip(text, limit):
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+_bot_username_cache = None
+
+
+async def get_bot_username():
+    global _bot_username_cache
+    if not _bot_username_cache:
+        me = await bot.get_me()
+        _bot_username_cache = me.username
+    return _bot_username_cache
+
+
+async def build_deeplink(build_id, tag=None):
+    username = await get_bot_username()
+    if tag:
+        return f"https://t.me/{username}?start=build_{build_id}_src_{tag}"
+    return f"https://t.me/{username}?start=build_{build_id}"
+
+
+# ---------- «ожидающая» сборка: человек пришёл по ссылке, но ещё не подписан ----------
+
+async def set_pending_build(user_id, build_id):
+    async with db_lock:
+        db.execute("UPDATE users SET pending_build=? WHERE user_id=?", (build_id, user_id))
+        db.commit()
+
+
+async def pop_pending_build(user_id):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT pending_build FROM users WHERE user_id=?", (user_id,))
+        row = lc.fetchone()
+        if not row or not row[0]:
+            return None
+        lc.execute("UPDATE users SET pending_build=NULL WHERE user_id=?", (user_id,))
+        db.commit()
+        return row[0]
+
+
+async def clear_pending_build(user_id):
+    async with db_lock:
+        db.execute(
+            "UPDATE users SET pending_build=NULL WHERE user_id=? AND pending_build IS NOT NULL",
+            (user_id,)
+        )
+        db.commit()
+
+
+# ---------- рассылка о новой сборке (общая для двух кнопок) ----------
+
+async def launch_build_notification(admin_id, build_id):
+    """Возвращает (статус, число получателей): ok / missing / done."""
+    b = await get_build_full(build_id)
+    if not b:
+        return "missing", 0
+
+    # атомарно «занимаем» отправку - по одной сборке рассылка уходит только один раз
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute(
+            "UPDATE builds SET notified_at=? WHERE id=? AND notified_at IS NULL",
+            (now_utc_str(), build_id)
+        )
+        claimed = lc.rowcount > 0
+        db.commit()
+
+    if not claimed:
+        return "done", 0
+
+    ids = await get_ids_where(SEGMENTS["notify"][1])
+
+    text = f"🔥 Вышла новая сборка!\n\n{b['name']}"
+    if b["description"]:
+        text += f"\n\n{b['description'][:300]}"
+    text += "\n\nЖми кнопку 👇\n(отключить уведомления можно в меню бота)"
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📥 Получить сборку", callback_data=f"build_{build_id}")
+    kb.adjust(1)
+
+    spawn(run_broadcast(
+        admin_id, ids, text,
+        photo=b["photo_id"], reply_markup=kb.as_markup(), parse_mode=None
+    ))
+    return "ok", len(ids)
+
+
+@dp.callback_query(F.data.startswith("admin_notify_build_"))
+async def admin_notify_build(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        build_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer()
+        return
+
+    status, n = await launch_build_notification(callback.from_user.id, build_id)
+
+    if status == "missing":
+        await callback.answer("Сборка не найдена", show_alert=True)
+        return
+    if status == "done":
+        await callback.answer("По этой сборке рассылка уже отправлялась", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(f"🚀 Рассылка о сборке запущена: {n} чел. Отчёт пришлю по завершении.")
+
+
+# ---------- публикация сборки в канал ----------
+
+CHANNEL_POST_TAG = "ch"  # метка источника для кнопки под постами канала: ch_b<ID сборки>
+
+_publishing = set()
+
+
+def channel_post_text(b):
+    lines = [f"🔥 {b['name']}"]
+    if b["description"]:
+        lines += ["", clip(b["description"], 600)]
+    lines += ["", "📥 Скачать - кнопка ниже 👇"]
+    text = "\n".join(lines)
+    return clip(text, 1024 if b["photo_id"] else 4000)
+
+
+async def channel_post_keyboard(build_id):
+    link = await build_deeplink(build_id, f"{CHANNEL_POST_TAG}_b{build_id}")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📥 Скачать сборку", url=link)
+    return kb.as_markup()
+
+
+async def get_publish_state(build_id):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT posted_at, notified_at FROM builds WHERE id=?", (build_id,))
+        row = lc.fetchone()
+    return (row[0], row[1]) if row else (None, None)
+
+
+@dp.callback_query(F.data == "admin_pub")
+async def admin_publish_list(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT id, name, posted_at FROM builds ORDER BY id DESC LIMIT 10")
+        rows = lc.fetchall()
+
+    await callback.answer()
+
+    if not rows:
+        await callback.message.answer("❌ Сборок пока нет.")
+        return
+
+    kb = InlineKeyboardBuilder()
+    for bid, name, posted_at in rows:
+        mark = "✅" if posted_at else "▫️"
+        kb.button(text=f"{mark} {short_title(name, 40)}", callback_data=f"admin_pub_{bid}")
+    kb.button(text="Отмена", callback_data="admin_cancel")
+    kb.adjust(1)
+
+    await callback.message.answer(
+        "📢 Какую сборку опубликовать в канале?\n\n✅ - уже публиковалась",
+        reply_markup=kb.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_pub_"))
+async def admin_publish_preview(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        build_id = int(callback.data.rsplit("_", 1)[1])
+    except ValueError:
+        await callback.answer()
+        return
+
+    b = await get_build_full(build_id)
+    if not b:
+        await callback.answer("Сборка не найдена", show_alert=True)
+        return
+
+    await callback.answer()
+
+    # точная копия будущего поста
+    try:
+        post_kb = await channel_post_keyboard(build_id)
+        text = channel_post_text(b)
+        if b["photo_id"]:
+            await callback.message.answer_photo(b["photo_id"], caption=text, reply_markup=post_kb)
+        else:
+            await callback.message.answer(text, reply_markup=post_kb)
+    except Exception as e:
+        await callback.message.answer(f"❌ Не удалось собрать превью: {str(e)[:200]}")
+        return
+
+    posted_at, notified_at = await get_publish_state(build_id)
+
+    warn = ""
+    if posted_at:
+        warn = f"⚠️ Эта сборка уже публиковалась ({fmt_date(posted_at)}). Новый пост выйдет отдельно.\n\n"
+
+    ctrl = InlineKeyboardBuilder()
+    ctrl.button(text="✅ Опубликовать в канале", callback_data=f"admin_pubgo_{build_id}_0")
+    if not notified_at:
+        n = await count_where(SEGMENTS["notify"][1])
+        ctrl.button(text=f"✅ В канал + уведомить ({n})", callback_data=f"admin_pubgo_{build_id}_1")
+    ctrl.button(text="Отмена", callback_data="admin_cancel")
+    ctrl.adjust(1)
+
+    await callback.message.answer(
+        f"{warn}👆 Так выглядит пост в канале. Публикуем?",
+        reply_markup=ctrl.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("admin_pubgo_"))
+async def admin_publish_go(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    try:
+        raw_id, flag = callback.data[len("admin_pubgo_"):].split("_")
+        build_id = int(raw_id)
+    except ValueError:
+        await callback.answer()
+        return
+    do_notify = flag == "1"
+
+    if build_id in _publishing:
+        await callback.answer("Уже публикую, секунду…")
+        return
+    _publishing.add(build_id)
+
+    async def finish(text):
+        try:
+            await callback.message.edit_text(text)
+        except Exception:
+            await callback.message.answer(text)
+
+    try:
+        b = await get_build_full(build_id)
+        if not b:
+            await callback.answer("Сборка не найдена", show_alert=True)
+            return
+
+        await callback.answer()
+        try:
+            await callback.message.edit_text("⏳ Публикую…")
+        except Exception:
+            pass
+
+        text = channel_post_text(b)
+        note = ""
+
+        try:
+            kb = await channel_post_keyboard(build_id)
+            if b["photo_id"]:
+                try:
+                    sent = await bot.send_photo(CHANNEL_ID, photo=b["photo_id"], caption=text, reply_markup=kb)
+                except TelegramBadRequest:
+                    # file_id не подошёл - публикуем текстом
+                    sent = await bot.send_message(
+                        CHANNEL_ID, channel_post_text(dict(b, photo_id=None)), reply_markup=kb
+                    )
+                    note = "\n\n⚠️ Скриншот Telegram не принял, пост вышел без картинки."
+            else:
+                sent = await bot.send_message(CHANNEL_ID, text, reply_markup=kb)
+        except Exception as e:
+            await finish(
+                f"❌ Не получилось опубликовать: {str(e)[:200]}\n\n"
+                "Проверь, что бот - админ канала с правом «Публикация сообщений»."
+            )
+            return
+
+        async with db_lock:
+            db.execute(
+                "UPDATE builds SET posted_at=?, channel_post_id=? WHERE id=?",
+                (now_utc_str(), sent.message_id, build_id)
+            )
+            db.commit()
+
+        report = f"✅ Опубликовано в канале:\n{CHANNEL_LINK}/{sent.message_id}{note}"
+
+        if do_notify:
+            status, n = await launch_build_notification(callback.from_user.id, build_id)
+            if status == "ok":
+                report += f"\n\n🚀 Уведомления подписчикам запущены: {n} чел. Отчёт пришлю по завершении."
+            elif status == "done":
+                report += "\n\nℹ️ Уведомления по этой сборке уже отправлялись - повторно не шлю."
+
+        await finish(report)
+
+    finally:
+        _publishing.discard(build_id)
 
 
 @dp.message(F.text.startswith("/start"))
@@ -1284,6 +1577,13 @@ async def start(message: Message):
 
     parts = message.text.split(maxsplit=1)
     param = parts[1].strip() if len(parts) > 1 else None
+
+    # Прямая ссылка на сборку: build_<ID> или build_<ID>_src_<метка>
+    build_param = None
+    if param:
+        m = re.fullmatch(r"build_(\d{1,9})(?:_src_([A-Za-z0-9_\-]{1,40}))?", param)
+        if m:
+            build_param = (int(m.group(1)), m.group(2))
 
     async with db_lock:
         # Проверяем - новый пользователь или уже был в боте
@@ -1293,7 +1593,9 @@ async def start(message: Message):
         # Источник: src_<метка> из ссылки, "ref" для рефералок, "direct" без параметра
         source_val = None
         if is_new_user:
-            if param and param.startswith("src_"):
+            if build_param:
+                source_val = build_param[1] or f"build_{build_param[0]}"
+            elif param and param.startswith("src_"):
                 source_val = re.sub(r"[^A-Za-z0-9_\-]", "", param[4:])[:40] or "direct"
             elif param:
                 source_val = "ref"
@@ -1324,7 +1626,7 @@ async def start(message: Message):
                     referrer_id = int(param[4:])
                 except Exception:
                     referrer_id = None
-            elif not param.startswith("src_"):
+            elif not param.startswith("src_") and not build_param:
                 cursor.execute("SELECT user_id FROM users WHERE ref_code=?", (param,))
                 ref = cursor.fetchone()
                 if ref:
@@ -1341,6 +1643,20 @@ async def start(message: Message):
                 await confirm_referral_if_pending(message.from_user.id)
         except Exception:
             pass
+
+    if build_param:
+        target_id = build_param[0]
+        async with db_lock:
+            cursor.execute("SELECT 1 FROM builds WHERE id=?", (target_id,))
+            build_exists = cursor.fetchone() is not None
+
+        if build_exists:
+            await build_flow(SimpleNamespace(from_user=message.from_user, message=message), target_id)
+            return
+
+        await message.answer("⚠️ Эта сборка больше недоступна. Актуальные - в меню 👇")
+    else:
+        await clear_pending_build(message.from_user.id)
 
     text = """
 🔥 крмп сборки от чапы 
@@ -2060,6 +2376,12 @@ async def build(callback: CallbackQuery):
     build_id = int(
         callback.data.split("_")[1]
     )
+    await build_flow(callback, build_id)
+
+
+async def build_flow(callback, build_id):
+    """Выдача сборки. callback - любой объект с from_user и message.answer:
+    нужен и для нажатия кнопки, и для прямой ссылки из /start."""
     user_id = callback.from_user.id
 
     # 1. ЧС (мягкий: однократное прощение при повторной подписке)
@@ -2073,8 +2395,10 @@ async def build(callback: CallbackQuery):
         await confirm_referral_if_pending(user_id)
 
     if not is_subscribed:
+        # запоминаем сборку: после «✅ Проверить» бот выдаст её сам
+        await set_pending_build(user_id, build_id)
         await callback.message.answer(
-            "❌ Подпишись на канал",
+            "📢 Чтобы получить сборку, подпишись на канал и нажми «✅ Проверить» - я сразу её пришлю.",
             reply_markup=sub_menu()
         )
         return
@@ -2123,6 +2447,10 @@ async def check(callback: CallbackQuery):
             "✅ Подписка найдена",
             show_alert=True
         )
+
+        pending = await pop_pending_build(callback.from_user.id)
+        if pending:
+            await build_flow(callback, pending)
 
     else:
 
@@ -3616,6 +3944,10 @@ async def handle_text(message: Message):
         b = await get_build_full(build_id)
         if b:
             await send_build_card(message, b)
+            next_kb = InlineKeyboardBuilder()
+            next_kb.button(text="📢 Опубликовать в канале", callback_data=f"admin_pub_{build_id}")
+            next_kb.adjust(1)
+            await message.answer("Дальше:", reply_markup=next_kb.as_markup())
         return
 
     if state == "add":
@@ -3646,15 +3978,22 @@ async def handle_text(message: Message):
             subscribers = await count_where(SEGMENTS["notify"][1])
 
             kb = InlineKeyboardBuilder()
-            kb.button(text=f"📣 Уведомить подписчиков ({subscribers})", callback_data=f"admin_notify_build_{new_build_id}")
             kb.button(text="🖼 Добавить скриншот / описание", callback_data=f"admin_card_{new_build_id}")
+            kb.button(text="📢 Опубликовать в канале", callback_data=f"admin_pub_{new_build_id}")
+            kb.button(text=f"📣 Только уведомить подписчиков ({subscribers})", callback_data=f"admin_notify_build_{new_build_id}")
             kb.adjust(1)
+
+            try:
+                direct = await build_deeplink(new_build_id)
+                link_line = f"\n\n🔗 Прямая ссылка на сборку:\n{direct}"
+            except Exception:
+                link_line = ""
 
             warn = "" if is_http_url(link) else "\n\n⚠️ Ссылка не начинается с https:// - кнопка «Скачать» работать не будет, покажу ссылку текстом."
 
             await message.answer(
-                f"✅ Сборка добавлена: {name} (ID {new_build_id}){warn}\n\n"
-                "Хочешь оформить карточку и сообщить подписчикам?",
+                f"✅ Сборка добавлена: {name} (ID {new_build_id}){warn}{link_line}\n\n"
+                "Дальше: оформи карточку и опубликуй в канале.",
                 reply_markup=kb.as_markup()
             )
 
