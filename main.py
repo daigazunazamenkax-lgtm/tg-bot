@@ -5,6 +5,7 @@ import sqlite3
 import random
 import string
 import time
+from html import escape as esc
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
@@ -274,6 +275,14 @@ ensure_column("builds", "channel_post_id", "INTEGER")
 ensure_column("users", "pending_build", "INTEGER")
 
 cursor.execute("""
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+db.commit()
+
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS build_votes (
     build_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
@@ -349,140 +358,82 @@ def main_menu(user_id=None):
 
     kb = InlineKeyboardBuilder()
 
-    kb.button(
-        text="📦 Скачать сборку",
-        callback_data="builds"
-    )
+    kb.button(text="📦 Скачать сборку", callback_data="builds")
+    kb.button(text="🎁 Бонусы", callback_data="bonuses")
+    kb.button(text="👤 Профиль", callback_data="profile")
+    kb.button(text="📢 Канал", url=CHANNEL_LINK)
+    kb.button(text="💬 Чат", url=CHAT_LINK)
 
-    kb.button(
-        text="🤝 Реферальная система",
-        callback_data="referral"
-    )
+    is_admin = bool(user_id and user_id in ADMINS)
+    if is_admin:
+        kb.button(text="⚙️ Админ-панель", callback_data="admin_panel")
 
-    kb.button(
-        text="🛒 Магазин",
-        callback_data="shop"
-    )
-
-    kb.button(
-        text="📋 Задания",
-        callback_data="tasks"
-    )
-
-    kb.button(
-        text="💰 Мой баланс",
-        callback_data="wallet"
-    )
-
-    kb.button(
-        text="🔔 Уведомления о сборках",
-        callback_data="notify_menu"
-    )
-
-    kb.button(
-        text="📢 Канал",
-        url=CHANNEL_LINK
-    )
-
-    kb.button(
-        text="💬 Чат",
-        url=CHAT_LINK
-    )
-
-    try:
-        if user_id and user_id in ADMINS:
-            kb.button(text="⚙️ ADMIN PANEL", callback_data="admin_panel")
-    except Exception:
-        pass
-
-    kb.adjust(1)
+    if is_admin:
+        kb.adjust(1, 2, 2, 1)
+    else:
+        kb.adjust(1, 2, 2)
 
     return kb.as_markup()
 
 
-def admin_menu():
+# Админ-меню: 4 группы вместо 16 кнопок в одну колонку
+ADMIN_GROUPS = {
+    "builds": ("📦 Сборки", [
+        ("➕ Добавить сборку", "admin_add"),
+        ("🗑 Удалить сборку", "admin_delete"),
+        ("⭐ Рекомендуемая", "admin_recommend"),
+        ("🖼 Карточка сборки", "admin_card"),
+        ("📢 Пост в канал", "admin_pub"),
+    ]),
+    "audience": ("📣 Аудитория", [
+        ("📢 Рассылка", "admin_broadcast"),
+        ("📊 Статистика", "admin_stats"),
+        ("🔔 Спросить про уведомления", "admin_ask_notify"),
+        ("🔓 Амнистия", "admin_amnesty"),
+    ]),
+    "economy": ("💰 Экономика", [
+        ("📋 Задания", "admin_tasks"),
+        ("🛒 Магазин", "admin_shop"),
+        ("🎟 Промокоды", "admin_promos"),
+        ("🎁 Награда за рефералов", "admin_reward"),
+    ]),
+    "settings": ("🔧 Настройки", [
+        ("👥 Спонсоры", "admin_sponsors"),
+        ("👮 Проверяющие", "admin_reviewers"),
+        ("🖼 Баннер приветствия", "admin_banner"),
+    ]),
+}
+
+
+def admin_menu(pending=None):
 
     kb = InlineKeyboardBuilder()
 
-    kb.button(
-        text="➕ Добавить сборку",
-        callback_data="admin_add"
-    )
+    label = "🧾 Проверка заданий"
+    if pending:
+        label += f" ({pending})"
+    kb.button(text=label, callback_data="review_tasks")
 
-    kb.button(
-        text="🗑 Удалить сборку",
-        callback_data="admin_delete"
-    )
+    for key, (title, _items) in ADMIN_GROUPS.items():
+        kb.button(text=title, callback_data=f"admin_g_{key}")
 
-    kb.button(
-        text="📊 Статистика",
-        callback_data="admin_stats"
-    )
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
 
-    kb.button(
-        text="📢 Рассылка",
-        callback_data="admin_broadcast"
-    )
+    kb.adjust(1, 2, 2, 1)
 
-    kb.button(
-        text="⭐ Рекомендуемая",
-        callback_data="admin_recommend"
-    )
+    return kb.as_markup()
 
-    kb.button(
-        text="🖼 Карточка сборки",
-        callback_data="admin_card"
-    )
 
-    kb.button(
-        text="📢 Пост в канал",
-        callback_data="admin_pub"
-    )
+def admin_group_menu(key):
 
-    kb.button(
-        text="🔔 Спросить про уведомления",
-        callback_data="admin_ask_notify"
-    )
+    _title, items = ADMIN_GROUPS[key]
 
-    kb.button(
-        text="🎁 Награда за рефералов",
-        callback_data="admin_reward"
-    )
+    kb = InlineKeyboardBuilder()
 
-    kb.button(
-        text="🔓 Амнистия",
-        callback_data="admin_amnesty"
-    )
+    for text, callback_data in items:
+        kb.button(text=text, callback_data=callback_data)
 
-    kb.button(
-        text="👥 Спонсоры",
-        callback_data="admin_sponsors"
-    )
-
-    kb.button(
-        text="📋 Задания",
-        callback_data="admin_tasks"
-    )
-
-    kb.button(
-        text="🛒 Магазин",
-        callback_data="admin_shop"
-    )
-
-    kb.button(
-        text="🎟 Промокоды",
-        callback_data="admin_promos"
-    )
-
-    kb.button(
-        text="👮 Проверяющие",
-        callback_data="admin_reviewers"
-    )
-
-    kb.button(
-        text="🧾 Проверить задания",
-        callback_data="review_tasks"
-    )
+    kb.button(text="🔙 Админ-панель", callback_data="admin_panel")
 
     kb.adjust(1)
 
@@ -621,13 +572,13 @@ async def confirm_referral_if_pending(user_id):
         name = str(user_id)
 
     try:
-        await bot.send_message(referrer_id, f"✅ Ваш реферал {name} подтвердил подписку. Подтверждённых: {cnt}")
+        await bot.send_message(referrer_id, f"✅ Твой реферал {name} подтвердил подписку. Подтверждено: {cnt}")
     except Exception:
         pass
 
     if reward_to_send:
         try:
-            await bot.send_message(referrer_id, f"🎁 Вы получили награду за 5 рефералов: {reward_to_send[1]}\n\nОбзор: {reward_to_send[2]}\nСсылка: {reward_to_send[3]}")
+            await bot.send_message(referrer_id, f"🎁 Награда за 5 рефералов: {reward_to_send[1]}\n\nОбзор: {reward_to_send[2]}\nСсылка: {reward_to_send[3]}")
         except Exception:
             pass
 
@@ -750,7 +701,7 @@ async def blacklist_check(callback):
             "Снять его можно в 🛒 Магазине за монеты или через администрацию."
         )
     else:
-        await callback.message.answer("❌ Вы в ЧС и не можете скачивать сборки. Обратитесь к администрации.")
+        await callback.message.answer("❌ Ты в ЧС и не можешь скачивать сборки. Напиши администрации.")
     return True
 
 
@@ -780,22 +731,39 @@ async def get_build_full(build_id):
 
 
 def render_card_text(b, link_in_text=False):
-    lines = [f"🔥 {b['name']}"]
-    if b["description"]:
-        lines += ["", b["description"]]
-    lines.append("")
-    if b["added_at"]:
-        lines.append(f"📅 Добавлена: {fmt_date(b['added_at'])}")
-    lines.append(f"📥 Скачали: {b['downloads']}")
-    if INSTALL_GUIDE:
-        lines += ["", "🛠 Как установить:", INSTALL_GUIDE]
-    if link_in_text or not is_http_url(b["link"]):
-        # ссылка без https:// или такая, которую Telegram не принял как кнопку - показываем текстом
-        lines += ["", "📥 Скачать:", str(b["link"])]
-    text = "\n".join(lines)
-    if b["photo_id"] and len(text) > 1024:
-        text = text[:1020] + "…"
-    return text
+    limit = 1024 if b["photo_id"] else 4000
+    name = b["name"] or ""
+    desc = (b["description"] or "").strip()
+    guide = INSTALL_GUIDE
+    text = ""
+
+    for _ in range(100):
+        lines = [f"🔥 <b>{h(name)}</b>"]
+        if desc:
+            lines += ["", h(desc)]
+        lines.append("")
+        if b["added_at"]:
+            lines.append(f"📅 Добавлена: {fmt_date(b['added_at'])}")
+        lines.append(f"📥 Скачали: {b['downloads']}")
+        if guide:
+            lines += ["", "🛠 <b>Как установить</b>", h(guide)]
+        if link_in_text or not is_http_url(b["link"]):
+            # ссылка без https:// или такая, которую Telegram не принял как кнопку - показываем текстом
+            lines += ["", "📥 Скачать:", h(b["link"])]
+        text = "\n".join(lines)
+
+        if len(text) <= limit:
+            return text
+
+        # не влезает в подпись к фото - укорачиваем описание, потом инструкцию, потом название
+        if desc:
+            desc = desc[:-100].rstrip(" …") + "…" if len(desc) > 100 else ""
+        elif guide:
+            guide = guide[:-100].rstrip(" …") + "…" if len(guide) > 100 else ""
+        else:
+            name = name[:-20] if len(name) > 20 else name[:1]
+
+    return text[:limit]
 
 
 def card_keyboard(b, with_url=True):
@@ -805,7 +773,7 @@ def card_keyboard(b, with_url=True):
         kb.button(text="📥 Скачать", url=str(b["link"]).strip())
     kb.button(text=f"👍 {b['likes']}" if b["likes"] else "👍", callback_data=f"bvote_{b['id']}_up")
     kb.button(text=f"👎 {b['dislikes']}" if b["dislikes"] else "👎", callback_data=f"bvote_{b['id']}_down")
-    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.button(text="🔙 Главное меню", callback_data="home_new")
     if has_link:
         kb.adjust(1, 2, 1)
     else:
@@ -818,17 +786,18 @@ async def send_build_card(target_message, b):
     kb = card_keyboard(b)
     if b["photo_id"]:
         try:
-            await target_message.answer_photo(b["photo_id"], caption=text, reply_markup=kb)
+            await target_message.answer_photo(b["photo_id"], caption=text, reply_markup=kb, parse_mode="HTML")
             return
         except Exception:
             pass  # file_id мог протухнуть - покажем карточку текстом
     try:
-        await target_message.answer(text, reply_markup=kb)
+        await target_message.answer(text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         # Telegram не принял URL-кнопку - отдаём ссылку текстом, чтобы человек точно получил сборку
         await target_message.answer(
             render_card_text(b, link_in_text=True),
-            reply_markup=card_keyboard(b, with_url=False)
+            reply_markup=card_keyboard(b, with_url=False),
+            parse_mode="HTML"
         )
 
 
@@ -939,25 +908,27 @@ async def notify_callbacks(callback: CallbackQuery):
             await callback.message.answer(text, reply_markup=back_kb.as_markup())
         return
 
-    if action == "notify_menu":
+    if action == "notify_toggle":
         async with db_lock:
             lc = db.cursor()
             lc.execute("SELECT notify_builds FROM users WHERE user_id=?", (user_id,))
             row = lc.fetchone()
-        state = row[0] if row else None
-        status = "включены 🔔" if state == 1 else "выключены 🔕"
-        kb = InlineKeyboardBuilder()
-        if state == 1:
-            kb.button(text="🔕 Выключить", callback_data="notify_off")
-        else:
-            kb.button(text="🔔 Включить", callback_data="notify_on")
-        kb.button(text="🔙 Главное меню", callback_data="main_menu")
-        kb.adjust(1)
+            new_value = 0 if (row and row[0] == 1) else 1
+            lc.execute(
+                "UPDATE users SET notify_builds=?, notify_asked_at=COALESCE(notify_asked_at, ?) WHERE user_id=?",
+                (new_value, now_utc_str(), user_id)
+            )
+            db.commit()
+        await callback.answer("🔔 Включено" if new_value else "🔕 Выключено")
+        text, kb = await render_profile(user_id)
+        await show(callback, text, kb)
+        return
+
+    if action == "notify_menu":
+        # старая кнопка из прежнего меню - ведём в профиль
         await callback.answer()
-        await callback.message.answer(
-            f"Уведомления о новых сборках сейчас {status}.",
-            reply_markup=kb.as_markup()
-        )
+        text, kb = await render_profile(user_id)
+        await show(callback, text, kb)
         return
 
     await callback.answer()
@@ -1389,12 +1360,27 @@ _publishing = set()
 
 
 def channel_post_text(b):
-    lines = [f"🔥 {b['name']}"]
-    if b["description"]:
-        lines += ["", clip(b["description"], 600)]
-    lines += ["", "📥 Скачать - кнопка ниже 👇"]
-    text = "\n".join(lines)
-    return clip(text, 1024 if b["photo_id"] else 4000)
+    limit = 1024 if b["photo_id"] else 4000
+    name = b["name"] or ""
+    desc = clip((b["description"] or "").strip(), 600)
+    text = ""
+
+    for _ in range(100):
+        lines = [f"🔥 <b>{h(name)}</b>"]
+        if desc:
+            lines += ["", h(desc)]
+        lines += ["", "📥 Скачать — кнопка ниже 👇"]
+        text = "\n".join(lines)
+
+        if len(text) <= limit:
+            return text
+
+        if desc:
+            desc = desc[:-100].rstrip(" …") + "…" if len(desc) > 100 else ""
+        else:
+            name = name[:-20] if len(name) > 20 else name[:1]
+
+    return text[:limit]
 
 
 async def channel_post_keyboard(build_id):
@@ -1464,9 +1450,9 @@ async def admin_publish_preview(callback: CallbackQuery):
         post_kb = await channel_post_keyboard(build_id)
         text = channel_post_text(b)
         if b["photo_id"]:
-            await callback.message.answer_photo(b["photo_id"], caption=text, reply_markup=post_kb)
+            await callback.message.answer_photo(b["photo_id"], caption=text, reply_markup=post_kb, parse_mode="HTML")
         else:
-            await callback.message.answer(text, reply_markup=post_kb)
+            await callback.message.answer(text, reply_markup=post_kb, parse_mode="HTML")
     except Exception as e:
         await callback.message.answer(f"❌ Не удалось собрать превью: {str(e)[:200]}")
         return
@@ -1534,15 +1520,17 @@ async def admin_publish_go(callback: CallbackQuery):
             kb = await channel_post_keyboard(build_id)
             if b["photo_id"]:
                 try:
-                    sent = await bot.send_photo(CHANNEL_ID, photo=b["photo_id"], caption=text, reply_markup=kb)
+                    sent = await bot.send_photo(
+                        CHANNEL_ID, photo=b["photo_id"], caption=text, reply_markup=kb, parse_mode="HTML"
+                    )
                 except TelegramBadRequest:
                     # file_id не подошёл - публикуем текстом
                     sent = await bot.send_message(
-                        CHANNEL_ID, channel_post_text(dict(b, photo_id=None)), reply_markup=kb
+                        CHANNEL_ID, channel_post_text(dict(b, photo_id=None)), reply_markup=kb, parse_mode="HTML"
                     )
                     note = "\n\n⚠️ Скриншот Telegram не принял, пост вышел без картинки."
             else:
-                sent = await bot.send_message(CHANNEL_ID, text, reply_markup=kb)
+                sent = await bot.send_message(CHANNEL_ID, text, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
             await finish(
                 f"❌ Не получилось опубликовать: {str(e)[:200]}\n\n"
@@ -1570,6 +1558,235 @@ async def admin_publish_go(callback: CallbackQuery):
 
     finally:
         _publishing.discard(build_id)
+
+
+# ======================================================================
+# v4 · интерфейс: компактное меню, экраны на месте, баннер, единое «ты»
+# ======================================================================
+
+def h(value):
+    """Экранирование текста для HTML-режима Telegram (нужно экранировать только < > &)."""
+    return esc("" if value is None else str(value), quote=False)
+
+
+def is_not_modified(error):
+    return "message is not modified" in str(error).lower()
+
+
+async def show(callback, text, kb=None):
+    """Показывает экран НА МЕСТЕ текущего сообщения (редактирует его),
+    а не шлёт новое - чат не превращается в ленту старых меню.
+    Если редактировать нельзя (фото-баннер, старое/удалённое сообщение) -
+    заменяем сообщение новым."""
+    msg = callback.message
+    if not getattr(msg, "photo", None):
+        try:
+            await msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+        except TelegramBadRequest as e:
+            if is_not_modified(e):
+                return
+        except Exception:
+            pass
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await msg.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+# состояния «жду ввод от пользователя», которые сбрасываются при уходе с экрана
+USER_INPUT_STATES = ("task_proof", "redeem_promo")
+
+
+def reset_input_state(user_id):
+    if user_states.get(user_id) in USER_INPUT_STATES:
+        user_states.pop(user_id, None)
+        user_temp.pop(user_id, None)
+
+
+# ---------- настройки (баннер) ----------
+
+async def get_setting(key):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = lc.fetchone()
+    return row[0] if row else None
+
+
+async def set_setting(key, value):
+    async with db_lock:
+        if value is None:
+            db.execute("DELETE FROM settings WHERE key=?", (key,))
+        else:
+            db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        db.commit()
+
+
+# ---------- главный экран ----------
+
+def home_text():
+    return (
+        "🔥 <b>Сборки Rodina RP от Чапы</b>\n\n"
+        "Нажми «Скачать сборку», выбери нужную — бот пришлёт ссылку."
+    )
+
+
+async def send_home(message, user_id):
+    """Главный экран новым сообщением (для /start): баннер + меню, либо просто текст + меню."""
+    kb = main_menu(user_id)
+    banner = await get_setting("banner_file_id")
+    if banner:
+        try:
+            await message.answer_photo(banner, caption=home_text(), reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass  # file_id не подошёл - показываем без баннера
+    await message.answer(home_text(), reply_markup=kb, parse_mode="HTML")
+
+
+async def go_home(callback):
+    """Главный экран по кнопке «Главное меню»: заменяет текущий экран."""
+    user_id = callback.from_user.id
+    reset_input_state(user_id)
+    kb = main_menu(user_id)
+    banner = await get_setting("banner_file_id")
+    msg = callback.message
+
+    if banner:
+        if getattr(msg, "photo", None):
+            try:
+                await msg.edit_caption(caption=home_text(), reply_markup=kb, parse_mode="HTML")
+                return
+            except TelegramBadRequest as e:
+                if is_not_modified(e):
+                    return
+            except Exception:
+                pass
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        try:
+            await msg.answer_photo(banner, caption=home_text(), reply_markup=kb, parse_mode="HTML")
+            return
+        except Exception:
+            pass
+
+    await show(callback, home_text(), kb)
+
+
+@dp.callback_query(F.data == "home_new")
+async def home_new(callback: CallbackQuery):
+    # кнопка под карточкой сборки: меню приходит НОВЫМ сообщением, карточка со ссылкой остаётся
+    await callback.answer()
+    await send_home(callback.message, callback.from_user.id)
+
+
+# ---------- профиль ----------
+
+async def render_profile(user_id):
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT coins, notify_builds FROM users WHERE user_id=?", (user_id,))
+        row = lc.fetchone()
+        lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
+        friends = lc.fetchone()[0]
+        lc.execute("SELECT COUNT(DISTINCT build_id) FROM downloads WHERE user_id=?", (user_id,))
+        downloaded = lc.fetchone()[0]
+
+    coins = (row[0] if row else 0) or 0
+    notify_on = bool(row and row[1] == 1)
+
+    text = (
+        "👤 <b>Профиль</b>\n\n"
+        f"Баланс: {coins} монет\n"
+        f"Скачано сборок: {downloaded}\n"
+        f"Приглашено друзей: {friends}\n"
+        f"Уведомления о сборках: {'включены' if notify_on else 'выключены'}"
+    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text="🔕 Выключить уведомления" if notify_on else "🔔 Включить уведомления",
+        callback_data="notify_toggle"
+    )
+    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.adjust(1)
+    return text, kb.as_markup()
+
+
+# ---------- реферальный экран (общий для кнопки и /ref) ----------
+
+async def build_referral_text(user_id):
+    username = await get_bot_username()
+    link = f"https://t.me/{username}?start=ref_{user_id}"
+
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
+        cnt = lc.fetchone()[0]
+        reward = None
+        if cnt >= 5:
+            lc.execute("SELECT title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
+            reward = lc.fetchone()
+
+    text = (
+        "🤝 <b>Партнёрская программа</b>\n\n"
+        "Пригласи 5 друзей — получи уникальную партнёрскую сборку.\n\n"
+        f"Твоя ссылка (нажми, чтобы скопировать):\n<code>{h(link)}</code>\n\n"
+        "Друг засчитывается после подписки на канал.\n\n"
+        f"Подтверждено: {cnt}/5"
+    )
+
+    if cnt >= 5:
+        if reward:
+            text += (
+                f"\n\n🎁 <b>Награда:</b> {h(reward[0])}\n"
+                f"Обзор (YouTube): {h(reward[1])}\n"
+                f"Ссылка: {h(reward[2])}"
+            )
+        else:
+            text += "\n\n🎁 Награда ещё не задана."
+    return text
+
+
+# ---------- админ: баннер приветствия ----------
+
+@dp.callback_query(F.data == "admin_banner")
+async def admin_banner(callback: CallbackQuery):
+    if callback.from_user.id not in ADMINS:
+        return
+
+    current = await get_setting("banner_file_id")
+    user_states[callback.from_user.id] = "banner_set"
+
+    await callback.answer()
+    await callback.message.answer(
+        "🖼 <b>Баннер приветствия</b>\n\n"
+        f"Сейчас: {'установлен' if current else 'не задан'}.\n\n"
+        "Пришли картинку — она появится над главным меню "
+        "(лучше горизонтальную, около 1280×720, отправляй как фото, не файлом).\n"
+        "Чтобы убрать баннер, отправь «-».",
+        parse_mode="HTML"
+    )
+
+
+# ---------- админ-панель: главное меню и группы ----------
+
+def admin_home_text(pending):
+    text = "⚙️ <b>Админ-панель</b>"
+    if pending:
+        text += f"\n\nЗаявок на проверке: {pending}"
+    return text
+
+
+async def pending_reviews_count():
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT COUNT(*) FROM task_submissions WHERE status='pending'")
+        return lc.fetchone()[0]
 
 
 @dp.message(F.text.startswith("/start"))
@@ -1658,16 +1875,7 @@ async def start(message: Message):
     else:
         await clear_pending_build(message.from_user.id)
 
-    text = """
-🔥 крмп сборки от чапы 
-
-Лучшие сборки Rodina RP
-"""
-
-    await message.answer(
-        text,
-        reply_markup=main_menu(message.from_user.id)
-    )
+    await send_home(message, message.from_user.id)
 
 
 @dp.message(F.text == "/admin")
@@ -1676,9 +1884,11 @@ async def admin_panel(message: Message):
     if message.from_user.id not in ADMINS:
         return
 
+    pending = await pending_reviews_count()
     await message.answer(
-        "⚙️ ADMIN PANEL",
-        reply_markup=admin_menu()
+        admin_home_text(pending),
+        reply_markup=admin_menu(pending),
+        parse_mode="HTML"
     )
 
 
@@ -1764,13 +1974,13 @@ async def admin_unref(message: Message):
     await message.answer(f"✅ Реферал {target_id} вручную подтверждён. Реферер уведомлён.")
 
     try:
-        await bot.send_message(referrer_id, f"✅ Ваш реферал был подтверждён администратором. Подтверждённых: {cnt}/5")
+        await bot.send_message(referrer_id, f"✅ Твой реферал был подтверждён администратором. Подтверждено: {cnt}/5")
     except Exception:
         pass
 
     if reward_to_send:
         try:
-            await bot.send_message(referrer_id, f"🎁 Вы получили награду за 5 рефералов: {reward_to_send[1]}\n\nОбзор: {reward_to_send[2]}\nСсылка: {reward_to_send[3]}")
+            await bot.send_message(referrer_id, f"🎁 Награда за 5 рефералов: {reward_to_send[1]}\n\nОбзор: {reward_to_send[2]}\nСсылка: {reward_to_send[3]}")
         except Exception:
             pass
 
@@ -1862,7 +2072,7 @@ async def admin_ban(message: Message):
         return
 
     try:
-        await bot.send_message(target_id, "❌ Вы добавлены в чёрный список бота. Обратитесь к администрации.")
+        await bot.send_message(target_id, "❌ Тебя добавили в чёрный список бота. Напиши администрации.")
     except Exception:
         pass
 
@@ -1899,14 +2109,13 @@ async def admin_unban(message: Message):
     await message.answer(f"✅ Пользователь {target_id} удалён из ЧС.")
 
     try:
-        await bot.send_message(target_id, "✅ Вы удалены из чёрного списка бота. Добро пожаловать обратно!")
+        await bot.send_message(target_id, "✅ Тебя убрали из чёрного списка бота. С возвращением!")
     except Exception:
         pass
 
 
-@dp.callback_query(F.data == "builds")
-async def builds(callback: CallbackQuery):
-
+async def render_builds(callback):
+    """Список сборок на месте текущего экрана. Ответ на callback отправляет вызывающий."""
     user_id = callback.from_user.id
 
     # Проверяем ЧС (мягкий: однократное прощение при повторной подписке)
@@ -1915,70 +2124,98 @@ async def builds(callback: CallbackQuery):
 
     # Проверяем подписку перед показом списка
     if not await check_sub(user_id):
-        await callback.message.answer("❌ Подпишись на канал", reply_markup=sub_menu())
+        await show(
+            callback,
+            "📢 <b>Нужна подписка</b>\n\nПодпишись на канал и нажми «✅ Проверить».",
+            sub_menu()
+        )
         return
 
     async with db_lock:
         lc = db.cursor()
-        lc.execute("SELECT * FROM builds ORDER BY id DESC")
+        lc.execute("SELECT id, name, recommended FROM builds ORDER BY id DESC")
         builds_list = lc.fetchall()
-        lc.execute("SELECT * FROM builds WHERE recommended=1 LIMIT 1")
-        recommended_build = lc.fetchone()
 
     if not builds_list:
-
-        await callback.message.answer(
-            "❌ Сборок пока нет"
-        )
-
+        back = InlineKeyboardBuilder()
+        back.button(text="🔙 Главное меню", callback_data="main_menu")
+        await show(callback, "📦 <b>Сборки</b>\n\nСборок пока нет.", back.as_markup())
         return
 
     kb = InlineKeyboardBuilder()
 
-    for build in builds_list:
-
+    for build_id, name, recommended in builds_list:
         kb.button(
-            text=f"🔥 {short_title(build[1])}{' ⭐' if len(build) > 4 and build[4] == 1 else ''}",
-            callback_data=f"build_{build[0]}"
+            text=f"🔥 {short_title(name)}{' ⭐' if recommended == 1 else ''}",
+            callback_data=f"build_{build_id}"
         )
 
     kb.button(text="🔙 Главное меню", callback_data="main_menu")
     kb.adjust(1)
 
-    text = "📦 Список сборок\n\n"
-
-    if recommended_build:
-        text += f"⭐ Рекомендуемая сборка:\n\n🔥 {recommended_build[1]}\n\n"
-
-    await callback.message.answer(
-        text,
-        reply_markup=kb.as_markup()
+    await show(
+        callback,
+        "📦 <b>Сборки</b>\n\nВыбери сборку. ⭐ — рекомендуем.",
+        kb.as_markup()
     )
+
+
+@dp.callback_query(F.data == "builds")
+async def builds(callback: CallbackQuery):
+    reset_input_state(callback.from_user.id)
+    await callback.answer()
+    await render_builds(callback)
+
+
+@dp.callback_query(F.data == "profile")
+async def profile(callback: CallbackQuery):
+    reset_input_state(callback.from_user.id)
+    await callback.answer()
+    text, kb = await render_profile(callback.from_user.id)
+    await show(callback, text, kb)
 
 
 @dp.callback_query(F.data == "wallet")
 async def wallet(callback: CallbackQuery):
+    # старая кнопка «Мой баланс» в уже отправленных сообщениях - ведём в профиль
+    await profile(callback)
+
+
+@dp.callback_query(F.data == "bonuses")
+async def bonuses(callback: CallbackQuery):
     user_id = callback.from_user.id
+    reset_input_state(user_id)
+    await callback.answer()
 
     async with db_lock:
         lc = db.cursor()
         lc.execute("SELECT coins FROM users WHERE user_id=?", (user_id,))
         row = lc.fetchone()
 
-    coins = row[0] if row else 0
+    coins = (row[0] if row else 0) or 0
+
     kb = InlineKeyboardBuilder()
+    kb.button(text="🤝 Друзья", callback_data="referral")
+    kb.button(text="📋 Задания", callback_data="tasks")
+    kb.button(text="🛒 Магазин", callback_data="shop")
+    kb.button(text="🎟 Промокод", callback_data="promo_enter")
     kb.button(text="🔙 Главное меню", callback_data="main_menu")
-    kb.adjust(1)
-    await callback.message.answer(
-        f"💰 Ваш баланс: {coins} монет\n\n"
-        "Монеты начисляются за одобренные задания и тратятся в магазине.",
-        reply_markup=kb.as_markup()
+    kb.adjust(2, 2, 1)
+
+    await show(
+        callback,
+        "🎁 <b>Бонусы</b>\n\n"
+        f"Баланс: {coins} монет\n\n"
+        "Приглашай друзей, выполняй задания и трать монеты в магазине.",
+        kb.as_markup()
     )
-    await callback.answer()
 
 
 @dp.callback_query(F.data == "tasks")
 async def user_tasks(callback: CallbackQuery):
+    reset_input_state(callback.from_user.id)
+    await callback.answer()
+
     async with db_lock:
         lc = db.cursor()
         lc.execute(
@@ -1999,30 +2236,30 @@ async def user_tasks(callback: CallbackQuery):
         )
         rows = lc.fetchall()
 
+    kb = InlineKeyboardBuilder()
+
     if not rows:
-        kb = InlineKeyboardBuilder()
-        kb.button(text="🔙 Главное меню", callback_data="main_menu")
-        await callback.message.answer(
-            "📋 Активных заданий пока нет.",
-            reply_markup=kb.as_markup()
+        kb.button(text="🔙 Бонусы", callback_data="bonuses")
+        await show(
+            callback,
+            "📋 <b>Задания</b>\n\nАктивных заданий пока нет.",
+            kb.as_markup()
         )
-        await callback.answer()
         return
 
-    kb = InlineKeyboardBuilder()
     for task_id, title, reward in rows:
         kb.button(
             text=f"📋 {title} — {reward} монет",
             callback_data=f"task_view_{task_id}"
         )
-    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.button(text="🔙 Бонусы", callback_data="bonuses")
     kb.adjust(1)
 
-    await callback.message.answer(
-        "📋 Доступные задания:\n\nВыбери задание, выполни его и отправь доказательство на проверку.",
-        reply_markup=kb.as_markup()
+    await show(
+        callback,
+        "📋 <b>Задания</b>\n\nВыбери задание, выполни и отправь доказательство на проверку.",
+        kb.as_markup()
     )
-    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("task_view_"))
@@ -2056,7 +2293,7 @@ async def task_view(callback: CallbackQuery):
         return
 
     title, description, reward = task
-    text = f"📋 {title}\n\n{description}\n\n🎁 Награда: {reward} монет"
+    text = f"📋 <b>{h(title)}</b>\n\n{h(description)}\n\n🎁 Награда: {reward} монет"
     kb = InlineKeyboardBuilder()
     if previous and previous[0] == "approved":
         text += "\n\n✅ Это задание уже одобрено."
@@ -2070,8 +2307,8 @@ async def task_view(callback: CallbackQuery):
     kb.button(text="🔙 К заданиям", callback_data="tasks")
     kb.adjust(1)
 
-    await callback.message.answer(text, reply_markup=kb.as_markup())
     await callback.answer()
+    await show(callback, text, kb.as_markup())
 
 
 @dp.callback_query(F.data.startswith("task_submit_"))
@@ -2109,16 +2346,26 @@ async def task_submit_start(callback: CallbackQuery):
 
     user_states[user_id] = "task_proof"
     user_temp[user_id] = {"task_id": task_id}
-    await callback.message.answer(
-        f"📎 Отправь доказательство выполнения задания «{task[0]}».\n\n"
-        "Можно отправить текст, фото с подписью или документ. "
-        "После этого заявка уйдёт администратору на проверку."
-    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 К заданиям", callback_data="tasks")
+    kb.adjust(1)
+
     await callback.answer()
+    await show(
+        callback,
+        "📎 <b>Доказательство</b>\n\n"
+        f"Задание: {h(task[0])}\n\n"
+        "Отправь текст, фото с подписью или документ — заявка уйдёт на проверку.",
+        kb.as_markup()
+    )
 
 
 @dp.callback_query(F.data == "shop")
 async def shop(callback: CallbackQuery):
+    reset_input_state(callback.from_user.id)
+    await callback.answer()
+
     async with db_lock:
         lc = db.cursor()
         lc.execute(
@@ -2127,32 +2374,32 @@ async def shop(callback: CallbackQuery):
         rows = lc.fetchall()
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="🎟 Ввести промокод", callback_data="promo_enter")
     for item_id, name, price in rows:
         kb.button(text=f"🛍 {name} — {price} монет", callback_data=f"shop_item_{item_id}")
-    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.button(text="🔙 Бонусы", callback_data="bonuses")
     kb.adjust(1)
 
-    if rows:
-        shop_text = "Выбери товар или введи промокод:"
-    else:
-        shop_text = "Товаров пока нет. Можно ввести промокод."
-
-    await callback.message.answer(
-        f"🛒 Магазин\n\n{shop_text}",
-        reply_markup=kb.as_markup()
+    await show(
+        callback,
+        "🛒 <b>Магазин</b>\n\n" + ("Выбери товар." if rows else "Товаров пока нет."),
+        kb.as_markup()
     )
-    await callback.answer()
 
 
 @dp.callback_query(F.data == "promo_enter")
 async def promo_enter(callback: CallbackQuery):
     user_states[callback.from_user.id] = "redeem_promo"
-    await callback.message.answer(
-        "🎟 Отправь промокод одним сообщением.\n\n"
-        "Код можно вводить заглавными или строчными буквами."
-    )
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Бонусы", callback_data="bonuses")
+    kb.adjust(1)
+
     await callback.answer()
+    await show(
+        callback,
+        "🎟 <b>Промокод</b>\n\nОтправь код одним сообщением. Регистр не важен.",
+        kb.as_markup()
+    )
 
 
 @dp.callback_query(F.data.startswith("shop_item_"))
@@ -2184,12 +2431,12 @@ async def shop_item(callback: CallbackQuery):
     kb.button(text="🔙 В магазин", callback_data="shop")
     kb.adjust(1)
 
-    await callback.message.answer(
-        f"🛍 {name}\n\n{description}\n\n"
-        f"Цена: {price} монет",
-        reply_markup=kb.as_markup()
-    )
     await callback.answer()
+    await show(
+        callback,
+        f"🛍 <b>{h(name)}</b>\n\n{h(description)}\n\nЦена: {price} монет",
+        kb.as_markup()
+    )
 
 
 @dp.callback_query(F.data.startswith("shop_buy_"))
@@ -2398,8 +2645,9 @@ async def build_flow(callback, build_id):
         # запоминаем сборку: после «✅ Проверить» бот выдаст её сам
         await set_pending_build(user_id, build_id)
         await callback.message.answer(
-            "📢 Чтобы получить сборку, подпишись на канал и нажми «✅ Проверить» - я сразу её пришлю.",
-            reply_markup=sub_menu()
+            "📢 <b>Нужна подписка</b>\n\nПодпишись на канал и нажми «✅ Проверить» — сборку пришлю сразу.",
+            reply_markup=sub_menu(),
+            parse_mode="HTML"
         )
         return
 
@@ -2450,7 +2698,13 @@ async def check(callback: CallbackQuery):
 
         pending = await pop_pending_build(callback.from_user.id)
         if pending:
+            try:
+                await callback.message.delete()
+            except Exception:
+                pass
             await build_flow(callback, pending)
+        else:
+            await render_builds(callback)
 
     else:
 
@@ -3177,10 +3431,8 @@ async def reject_task(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "main_menu")
 async def back_to_main(callback: CallbackQuery):
-    await callback.message.answer(
-        "🔥 крмп сборки от чапы\n\nЛучшие сборки Rodina RP",
-        reply_markup=main_menu(callback.from_user.id)
-    )
+    await callback.answer()
+    await go_home(callback)
 
 
 @dp.callback_query(F.data == "admin_panel")
@@ -3189,10 +3441,24 @@ async def admin_panel_callback(callback: CallbackQuery):
     if callback.from_user.id not in ADMINS:
         return
 
-    await callback.message.answer(
-        "⚙️ ADMIN PANEL",
-        reply_markup=admin_menu()
-    )
+    await callback.answer()
+    pending = await pending_reviews_count()
+    await show(callback, admin_home_text(pending), admin_menu(pending))
+
+
+@dp.callback_query(F.data.startswith("admin_g_"))
+async def admin_group(callback: CallbackQuery):
+
+    if callback.from_user.id not in ADMINS:
+        return
+
+    key = callback.data[len("admin_g_"):]
+    if key not in ADMIN_GROUPS:
+        await callback.answer()
+        return
+
+    await callback.answer()
+    await show(callback, f"<b>{ADMIN_GROUPS[key][0]}</b>", admin_group_menu(key))
 
 
 @dp.callback_query(F.data == "admin_add")
@@ -3326,12 +3592,12 @@ async def admin_reward(callback: CallbackQuery):
             f"{row[1]}\n"
             f"YouTube: {row[2]}\n"
             f"Ссылка: {row[3]}\n\n"
-            "Чтобы установить новую - отправьте сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
+            "Чтобы установить новую - отправь сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
         )
     else:
         text = (
             "Награда не задана.\n"
-            "Чтобы установить - отправьте сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
+            "Чтобы установить - отправь сообщение в формате:\nНазвание|YouTube ссылка|Ссылка для скачивания"
         )
 
     user_states[callback.from_user.id] = "set_reward"
@@ -3423,69 +3689,22 @@ async def admin_recommend(callback: CallbackQuery):
 @dp.callback_query(F.data == "referral")
 async def referral_panel(callback: CallbackQuery):
 
-    user_id = callback.from_user.id
-
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{user_id}"
-
-    async with db_lock:
-        lc = db.cursor()
-        lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
-        cnt = lc.fetchone()[0]
-        reward = None
-        if cnt >= 5:
-            lc.execute("SELECT title, youtube_link, download_link FROM rewards WHERE active=1 LIMIT 1")
-            reward = lc.fetchone()
-
-    text = (
-        "🤝 Партнёрская программа:\n\n"
-        "За приглашение 5 человек в бота вы получите уникальную сборку для партнеров.\n\n"
-        f"Ваша ссылка: {link}\n\n"
-        "Важно: реферал засчитывается только после подписки на телеграмм канал.\n\n"
-    )
-
-    if cnt < 5:
-        text += f"Подтверждённых рефералов: {cnt}/5"
-    else:
-        if reward:
-            text += (
-                f"Подтверждённых рефералов: {cnt}/5\n\n"
-                f"🎁 Награда: {reward[0]}\n"
-                f"Обзор (YouTube): {reward[1]}\n"
-                f"Ссылка для получения: {reward[2]}\n"
-            )
-        else:
-            text += f"Подтверждённых рефералов: {cnt}/5\n\n🎁 Награда ещё не задана админом."
+    await callback.answer()
 
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔙 Главное меню", callback_data="main_menu")
+    kb.button(text="🔙 Бонусы", callback_data="bonuses")
     kb.adjust(1)
 
-    await callback.message.answer(text, reply_markup=kb.as_markup())
+    await show(callback, await build_referral_text(callback.from_user.id), kb.as_markup())
 
 
 @dp.message(F.text == "/ref")
 async def ref_command(message: Message):
 
-    user_id = message.from_user.id
-
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start=ref_{user_id}"
-
-    async with db_lock:
-        lc = db.cursor()
-        lc.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (user_id,))
-        cnt = lc.fetchone()[0]
-
-    text = (
-        "🤝 Партнёрская программа:\n\n"
-        "За приглашение 5 человек в бота вы получите уникальную сборку для партнеров.\n\n"
-        f"Ваша ссылка: {link}\n\n"
-        "Важно: реферал засчитывается только после подписки на телеграмм канал.\n\n"
-        f"Подтверждённых рефералов: {cnt}/5"
+    await message.answer(
+        await build_referral_text(message.from_user.id),
+        parse_mode="HTML"
     )
-
-    await message.answer(text)
 
 
 @dp.message()
@@ -3881,13 +4100,33 @@ async def handle_text(message: Message):
             try:
                 await bot.send_message(
                     reviewer_id,
-                    "👮 Вам выдан доступ к проверке заданий.\n"
+                    "👮 Тебе выдан доступ к проверке заданий.\n"
                     "Открыть список заявок: /review"
                 )
             except Exception:
                 pass
         except (ValueError, TypeError, AttributeError):
             await message.answer("❌ ID должен быть положительным числом.")
+        return
+
+    if state == "banner_set":
+        banner_photo = message.photo[-1].file_id if message.photo else None
+        banner_text = (message.text or "").strip()
+
+        if banner_text == "-":
+            await set_setting("banner_file_id", None)
+            user_states.pop(user_id, None)
+            await message.answer("✅ Баннер убран.")
+            return
+
+        if not banner_photo:
+            await message.answer("❌ Пришли картинку как фото (не файлом) или «-», чтобы убрать баннер.")
+            return
+
+        await set_setting("banner_file_id", banner_photo)
+        user_states.pop(user_id, None)
+        await message.answer("✅ Баннер сохранён. Так выглядит главный экран:")
+        await send_home(message, user_id)
         return
 
     if state == "card_pick":
@@ -4438,7 +4677,7 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
         try:
             await bot.send_message(
                 referrer_id,
-                f"❌ Ваш реферал отписался от канала - реферал аннулирован.\nПодтверждённых: {cnt}/5"
+                f"❌ Твой реферал отписался от канала - реферал аннулирован.\nПодтверждено: {cnt}/5"
             )
         except Exception:
             pass
