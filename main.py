@@ -4608,12 +4608,130 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
                 return web.json_response({"ok": False, "error": "Ты уже использовал этот промокод."})
         return web.json_response({"ok": True, "coins": p[1]})
 
+    # ---------- Апгрейдер (только монеты бота) ----------
+    import secrets
+    rng = secrets.SystemRandom()
+    EDGE = float(os.environ.get("UPGRADER_EDGE", "0.08"))            # комиссия казино
+    MULTS = [1.5, 2, 3, 5, 10, 20]
+    MIN_BET = int(os.environ.get("UPGRADER_MIN_BET", "5"))
+    MAX_BET = int(os.environ.get("UPGRADER_MAX_BET", "500"))
+    PRIZE_CHANCE = float(os.environ.get("UPGRADER_PRIZE_CHANCE", "2"))  # % при выигрыше (1-3)
+    PRIZE_MIN_BET = int(os.environ.get("UPGRADER_PRIZE_MIN_BET", "50"))
+    PRIZE_ITEM_ID = int(os.environ.get("UPGRADER_PRIZE_ITEM_ID", "0"))  # 0 = первый активный channel-товар
+    last_spin = {}
+    db.execute("""CREATE TABLE IF NOT EXISTS upgrader_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, bet INTEGER NOT NULL,
+        mult REAL NOT NULL, chance REAL NOT NULL, roll REAL NOT NULL, win INTEGER NOT NULL,
+        payout INTEGER NOT NULL, prize_item INTEGER, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    db.commit()
+
+    def chance_of(m):
+        return round((1 - EDGE) / m * 100, 2)
+
+    def prize_item(c, uid):
+        if PRIZE_ITEM_ID:
+            c.execute("SELECT id, name, target FROM shop_items WHERE id=? AND item_type='channel'", (PRIZE_ITEM_ID,))
+        else:
+            c.execute("SELECT id, name, target FROM shop_items WHERE item_type='channel' AND active=1 ORDER BY id LIMIT 1")
+        it = c.fetchone()
+        if not it:
+            return None
+        c.execute("SELECT 1 FROM purchases WHERE item_id=? AND user_id=? AND status IN ('pending','approved','delivered')",
+                  (it[0], uid))
+        return None if c.fetchone() else it
+
+    async def up_config(request):
+        uid = auth(request)
+        async with db_lock:
+            c = db.cursor()
+            c.execute("SELECT coins FROM users WHERE user_id=?", (uid,))
+            row = c.fetchone()
+            it = prize_item(c, uid)
+        return web.json_response({
+            "coins": (row[0] if row else 0) or 0, "min": MIN_BET, "max": MAX_BET,
+            "mults": [{"m": m, "chance": chance_of(m)} for m in MULTS],
+            "prize": {"name": it[1], "chance": PRIZE_CHANCE, "min_bet": PRIZE_MIN_BET} if it else None,
+        })
+
+    async def upgrade(request):
+        uid = auth(request)
+        fail = lambda t: web.json_response({"ok": False, "error": t})
+        try:
+            d = await request.json()
+            bet, m = int(d["bet"]), float(d["mult"])
+        except Exception:
+            return fail("Некорректные данные.")
+        if m not in MULTS or not MIN_BET <= bet <= MAX_BET:
+            return fail(f"Ставка от {MIN_BET} до {MAX_BET} монет.")
+        now = time.time()
+        if now - last_spin.get(uid, 0) < 1.5:
+            return fail("Не так быстро.")
+        last_spin[uid] = now
+
+        chance = chance_of(m)
+        roll = round(rng.random() * 100, 2)      # 0..100, выигрыш если roll < chance
+        win = roll < chance
+        payout = int(bet * m) if win else 0
+
+        prize = link = None
+        if win and bet >= PRIZE_MIN_BET and rng.random() * 100 < PRIZE_CHANCE:
+            async with db_lock:
+                it = prize_item(db.cursor(), uid)
+            if it:
+                try:
+                    inv = await bot.create_chat_invite_link(
+                        int(it[2]), name=f"upgrader-{uid}", creates_join_request=True,
+                        expire_date=datetime.now(timezone.utc) + timedelta(days=7))
+                    prize, link = it, inv.invite_link
+                except Exception:
+                    prize = link = None
+
+        async with db_lock:
+            c = db.cursor()
+            c.execute("SELECT coins, blacklisted FROM users WHERE user_id=?", (uid,))
+            u = c.fetchone()
+            if not u:
+                return fail("Сначала запусти бота командой /start.")
+            if u[1] == 1:
+                return fail("Недоступно для пользователей из ЧС.")
+            if (u[0] or 0) < bet:
+                return fail("Недостаточно монет.")
+            if prize and prize_item(c, uid) is None:
+                prize = link = None
+            c.execute("UPDATE users SET coins=coins-?+? WHERE user_id=?", (bet, payout, uid))
+            if prize:
+                c.execute("INSERT INTO purchases (item_id, user_id, price, status, delivery_link) "
+                          "VALUES (?, ?, 0, 'approved', ?)", (prize[0], uid, link))
+            c.execute("INSERT INTO upgrader_log (user_id, bet, mult, chance, roll, win, payout, prize_item) "
+                      "VALUES (?,?,?,?,?,?,?,?)", (uid, bet, m, chance, roll, int(win), payout, prize[0] if prize else None))
+            db.commit()
+            balance = (u[0] or 0) - bet + payout
+
+        if prize:
+            try:
+                await bot.send_message(uid, f"🎁 Ты выиграл в Апгрейдере доступ: «{prize[1]}»!\n\n"
+                                            f"Отправь заявку по ссылке, бот одобрит её автоматически:\n{link}")
+            except Exception:
+                pass
+            for admin_id in ADMINS:
+                try:
+                    await bot.send_message(admin_id, f"🎰 Апгрейдер: пользователь {uid} выиграл «{prize[1]}» (ставка {bet}, x{m:g})")
+                except Exception:
+                    pass
+        return web.json_response({
+            "ok": True, "win": win, "bet": bet, "mult": m, "chance": chance, "roll": roll,
+            "payout": payout, "balance": balance,
+            "prize": {"name": prize[1], "link": link} if prize else None,
+        })
+
     app.middlewares.append(cors)
     app.router.add_get("/api/me", me)
     app.router.add_get("/api/builds", builds)
     app.router.add_get("/api/tasks", tasks)
     app.router.add_get("/api/shop", shop)
     app.router.add_post("/api/promo", promo)
+    app.router.add_get("/api/upgrade/config", up_config)
+    app.router.add_post("/api/upgrade", upgrade)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
 
 
