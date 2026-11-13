@@ -9,6 +9,10 @@ from html import escape as esc
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from aiohttp import web
+import hashlib
+import hmac
+import json
+from urllib.parse import parse_qsl
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
@@ -4481,6 +4485,138 @@ async def handle_text(message: Message):
         return
 
 
+# ---------- API для мини-аппа ----------
+
+def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
+    origin = os.environ.get("WEBAPP_ORIGIN", "*")  # напр. https://username.github.io
+    secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+
+    @web.middleware
+    async def cors(request, handler):
+        if request.method == "OPTIONS":
+            resp = web.Response()
+        else:
+            try:
+                resp = await handler(request)
+            except web.HTTPException as e:
+                resp = e
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Init-Data"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp
+
+    def auth(request):
+        data = dict(parse_qsl(request.headers.get("X-Init-Data", ""), keep_blank_values=True))
+        got = data.pop("hash", "")
+        check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+        if not got or not hmac.compare_digest(calc, got):
+            raise web.HTTPUnauthorized(text="bad signature")
+        if time.time() - int(data.get("auth_date", 0)) > 86400:
+            raise web.HTTPUnauthorized(text="expired")
+        return json.loads(data["user"])["id"]
+
+    async def me(request):
+        uid = auth(request)
+        username = await get_bot_username()
+        async with db_lock:
+            c = db.cursor()
+            c.execute("SELECT coins FROM users WHERE user_id=?", (uid,))
+            row = c.fetchone()
+            c.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=? AND confirmed=1", (uid,))
+            friends = c.fetchone()[0]
+            c.execute("SELECT COUNT(DISTINCT build_id) FROM downloads WHERE user_id=?", (uid,))
+            downloaded = c.fetchone()[0]
+        return web.json_response({
+            "registered": row is not None,
+            "coins": (row[0] if row else 0) or 0,
+            "friends": friends,
+            "downloaded": downloaded,
+            "subscribed": await check_sub(uid),
+            "bot": username,
+            "ref_link": f"https://t.me/{username}?start=ref_{uid}",
+        })
+
+    async def builds(request):
+        auth(request)
+        async with db_lock:
+            c = db.cursor()
+            c.execute("SELECT id, name, description, downloads, recommended FROM builds ORDER BY id DESC")
+            rows = c.fetchall()
+        return web.json_response([
+            {"id": r[0], "name": r[1], "description": r[2] or "", "downloads": r[3] or 0, "recommended": r[4] == 1}
+            for r in rows
+        ])
+
+    async def tasks(request):
+        uid = auth(request)
+        async with db_lock:
+            c = db.cursor()
+            c.execute(
+                """SELECT t.id, t.title, t.description, t.reward FROM tasks t
+                   WHERE t.active=1 AND NOT EXISTS (
+                     SELECT 1 FROM task_submissions s
+                     WHERE s.task_id=t.id AND s.user_id=? AND s.status IN ('pending','approved'))
+                   ORDER BY t.id DESC""", (uid,))
+            rows = c.fetchall()
+        return web.json_response([{"id": r[0], "title": r[1], "description": r[2], "reward": r[3]} for r in rows])
+
+    async def shop(request):
+        auth(request)
+        async with db_lock:
+            c = db.cursor()
+            c.execute("SELECT id, name, description, price FROM shop_items WHERE active=1 ORDER BY id DESC")
+            rows = c.fetchall()
+        return web.json_response([{"id": r[0], "name": r[1], "description": r[2], "price": r[3]} for r in rows])
+
+    async def promo(request):
+        uid = auth(request)
+        try:
+            code = str((await request.json()).get("code", "")).strip()
+        except Exception:
+            code = ""
+        if not code:
+            return web.json_response({"ok": False, "error": "Введи промокод."})
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        async with db_lock:
+            c = db.cursor()
+            c.execute("SELECT 1 FROM users WHERE user_id=?", (uid,))
+            if not c.fetchone():
+                return web.json_response({"ok": False, "error": "Сначала запусти бота командой /start."})
+            c.execute("SELECT id, reward_coins, max_uses, uses_count, expires_at, active "
+                      "FROM promo_codes WHERE code=? COLLATE NOCASE", (code,))
+            p = c.fetchone()
+            if not p:
+                err = "Промокод не найден."
+            elif not p[5]:
+                err = "Промокод отключён."
+            elif p[4] and p[4] <= now:
+                err = "Срок действия промокода истёк."
+            elif p[2] and p[3] >= p[2]:
+                err = "Лимит использований исчерпан."
+            else:
+                err = None
+            if err:
+                return web.json_response({"ok": False, "error": err})
+            try:
+                c.execute("INSERT INTO promo_redemptions (promo_id, user_id) VALUES (?, ?)", (p[0], uid))
+                c.execute("UPDATE promo_codes SET uses_count=uses_count+1 WHERE id=?", (p[0],))
+                c.execute("UPDATE users SET coins=COALESCE(coins,0)+? WHERE user_id=?", (p[1], uid))
+                db.commit()
+            except Exception:
+                db.rollback()
+                return web.json_response({"ok": False, "error": "Ты уже использовал этот промокод."})
+        return web.json_response({"ok": True, "coins": p[1]})
+
+    app.middlewares.append(cors)
+    app.router.add_get("/api/me", me)
+    app.router.add_get("/api/builds", builds)
+    app.router.add_get("/api/tasks", tasks)
+    app.router.add_get("/api/shop", shop)
+    app.router.add_post("/api/promo", promo)
+    app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
+
+
 async def health(request):
     return web.Response(text="OK")
 
@@ -4490,6 +4626,7 @@ async def run_web():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
+    register_api(app, token=TOKEN, db=db, db_lock=db_lock, check_sub=check_sub, get_bot_username=get_bot_username)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
