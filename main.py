@@ -1915,6 +1915,28 @@ async def admin_panel(message: Message):
     )
 
 
+@dp.message(F.text == "/upgrader")
+async def upgrader_stats(message: Message):
+    if message.from_user.id not in ADMINS:
+        return
+    async with db_lock:
+        lc = db.cursor()
+        lc.execute("SELECT COUNT(*), COALESCE(SUM(win),0), COALESCE(SUM(bet),0), COALESCE(SUM(payout),0), "
+                   "COUNT(DISTINCT user_id) FROM upgrader_log")
+        n, w, bets, pay, users = lc.fetchone()
+        lc.execute("SELECT COUNT(*) FROM upgrader_log WHERE ts >= datetime('now','-1 day')")
+        day = lc.fetchone()[0]
+        lc.execute("SELECT user_id, bet, mult, ts FROM upgrader_log WHERE prize_item IS NOT NULL ORDER BY id DESC LIMIT 10")
+        prizes = lc.fetchall()
+    text = (f"🎰 Апгрейдер\n\nИгр всего: {n} (за сутки: {day}), игроков: {users}\n"
+            f"Побед: {w} ({round(w * 100 / n, 1) if n else 0}%)\n"
+            f"Поставлено: {bets}, выплачено: {pay}, сгорело: {bets - pay}\n\n"
+            f"🎁 Приватка выдана: {len(prizes)}\n")
+    for uid_, bet_, mult_, ts_ in prizes:
+        text += f"• {ts_} — {uid_} (ставка {bet_}, x{mult_:g})\n"
+    await message.answer(text)
+
+
 @dp.message(F.text == "/users")
 async def show_users(message: Message):
     if message.from_user.id not in ADMINS:
@@ -4634,8 +4656,10 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
     MULTS = [1.5, 2, 3, 5, 10, 20]
     MIN_BET = int(os.environ.get("UPGRADER_MIN_BET", "5"))
     MAX_BET = int(os.environ.get("UPGRADER_MAX_BET", "500"))
-    PRIZE_CHANCE = float(os.environ.get("UPGRADER_PRIZE_CHANCE", "2"))  # % при выигрыше (1-3)
-    PRIZE_MIN_BET = int(os.environ.get("UPGRADER_PRIZE_MIN_BET", "50"))
+    PRIZE_CHANCE = float(os.environ.get("UPGRADER_PRIZE_CHANCE", "1"))  # % при выигрыше (1-3)
+    PRIZE_MIN_BET = int(os.environ.get("UPGRADER_PRIZE_MIN_BET", "100"))
+    DAILY_SPINS = int(os.environ.get("UPGRADER_DAILY_SPINS", "30"))         # игр на человека в сутки
+    PRIZE_DAILY_CAP = int(os.environ.get("UPGRADER_PRIZE_DAILY_CAP", "1"))  # выдач приватки в сутки на всех
     PRIZE_ITEM_ID = int(os.environ.get("UPGRADER_PRIZE_ITEM_ID", "0"))  # 0 = первый активный channel-товар
     last_spin = {}
     db.execute("""CREATE TABLE IF NOT EXISTS upgrader_log (
@@ -4643,6 +4667,14 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
         mult REAL NOT NULL, chance REAL NOT NULL, roll REAL NOT NULL, win INTEGER NOT NULL,
         payout INTEGER NOT NULL, prize_item INTEGER, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
     db.commit()
+
+    def prizes_today(c):
+        c.execute("SELECT COUNT(*) FROM upgrader_log WHERE prize_item IS NOT NULL AND ts >= datetime('now','-1 day')")
+        return c.fetchone()[0]
+
+    def spins_today(c, uid):
+        c.execute("SELECT COUNT(*) FROM upgrader_log WHERE user_id=? AND ts >= datetime('now','-1 day')", (uid,))
+        return c.fetchone()[0]
 
     def chance_of(m):
         return round((1 - EDGE) / m * 100, 2)
@@ -4666,13 +4698,14 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
             c.execute("SELECT coins FROM users WHERE user_id=?", (uid,))
             row = c.fetchone()
             it = prize_item(c, uid)
+            left = max(0, DAILY_SPINS - spins_today(c, uid))
             c.execute("SELECT bet, mult, win, payout FROM upgrader_log WHERE user_id=? ORDER BY id DESC LIMIT 8", (uid,))
             hist = [{"bet": r[0], "mult": r[1], "win": bool(r[2]), "payout": r[3]} for r in c.fetchall()]
             c.execute("SELECT COUNT(*), COALESCE(SUM(win),0), MAX(COALESCE(MAX(payout-bet),0),0) "
                       "FROM upgrader_log WHERE user_id=?", (uid,))
             st = c.fetchone()
         return web.json_response({
-            "history": hist, "stats": {"spins": st[0], "wins": st[1], "best": st[2]},
+            "left": left, "history": hist, "stats": {"spins": st[0], "wins": st[1], "best": st[2]},
             "coins": (row[0] if row else 0) or 0, "min": MIN_BET, "max": MAX_BET,
             "mults": [{"m": m, "chance": chance_of(m)} for m in MULTS],
             "prize": {"name": it[1], "chance": PRIZE_CHANCE, "min_bet": PRIZE_MIN_BET} if it else None,
@@ -4710,6 +4743,9 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
         if now - last_spin.get(uid, 0) < 1.5:
             return fail("Не так быстро.")
         last_spin[uid] = now
+        async with db_lock:
+            if spins_today(db.cursor(), uid) >= DAILY_SPINS:
+                return fail(f"Лимит {DAILY_SPINS} игр в сутки. Возвращайся позже.")
 
         chance = chance_of(m)
         roll = round(rng.random() * 100, 2)      # 0..100, выигрыш если roll < chance
@@ -4719,7 +4755,8 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
         prize = link = None
         if win and bet >= PRIZE_MIN_BET and rng.random() * 100 < PRIZE_CHANCE:
             async with db_lock:
-                it = prize_item(db.cursor(), uid)
+                c0 = db.cursor()
+                it = None if prizes_today(c0) >= PRIZE_DAILY_CAP else prize_item(c0, uid)
             if it:
                 try:
                     inv = await bot.create_chat_invite_link(
@@ -4739,7 +4776,7 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
                 return fail("Недоступно для пользователей из ЧС.")
             if (u[0] or 0) < bet:
                 return fail("Недостаточно монет.")
-            if prize and prize_item(c, uid) is None:
+            if prize and (prize_item(c, uid) is None or prizes_today(c) >= PRIZE_DAILY_CAP):
                 prize = link = None
             c.execute("UPDATE users SET coins=coins-?+? WHERE user_id=?", (bet, payout, uid))
             if prize:
