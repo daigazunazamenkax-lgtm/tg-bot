@@ -1806,6 +1806,13 @@ async def start(message: Message):
         if m:
             build_param = (int(m.group(1)), m.group(2))
 
+    # Прямая ссылка из мини-аппа: task_<ID> (задание) или shop_<ID> (товар)
+    deep_param = None
+    if param:
+        dm = re.fullmatch(r"(task|shop)_(\d{1,9})", param)
+        if dm:
+            deep_param = (dm.group(1), dm.group(2))
+
     async with db_lock:
         # Проверяем - новый пользователь или уже был в боте
         cursor.execute("SELECT user_id FROM users WHERE user_id=?", (message.from_user.id,))
@@ -1816,6 +1823,8 @@ async def start(message: Message):
         if is_new_user:
             if build_param:
                 source_val = build_param[1] or f"build_{build_param[0]}"
+            elif deep_param:
+                source_val = "miniapp"
             elif param and param.startswith("src_"):
                 source_val = re.sub(r"[^A-Za-z0-9_\-]", "", param[4:])[:40] or "direct"
             elif param:
@@ -1847,7 +1856,7 @@ async def start(message: Message):
                     referrer_id = int(param[4:])
                 except Exception:
                     referrer_id = None
-            elif not param.startswith("src_") and not build_param:
+            elif not param.startswith("src_") and not build_param and not deep_param:
                 cursor.execute("SELECT user_id FROM users WHERE ref_code=?", (param,))
                 ref = cursor.fetchone()
                 if ref:
@@ -1864,6 +1873,16 @@ async def start(message: Message):
                 await confirm_referral_if_pending(message.from_user.id)
         except Exception:
             pass
+
+    if deep_param:
+        async def _noop(*a, **k):
+            return None
+        kind, item_id = deep_param
+        cb = SimpleNamespace(
+            data=f"{'task_view' if kind == 'task' else 'shop_item'}_{item_id}",
+            from_user=message.from_user, message=message, answer=_noop)
+        await (task_view if kind == "task" else shop_item)(cb)
+        return
 
     if build_param:
         target_id = build_param[0]
@@ -4647,11 +4666,35 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
             c.execute("SELECT coins FROM users WHERE user_id=?", (uid,))
             row = c.fetchone()
             it = prize_item(c, uid)
+            c.execute("SELECT bet, mult, win, payout FROM upgrader_log WHERE user_id=? ORDER BY id DESC LIMIT 8", (uid,))
+            hist = [{"bet": r[0], "mult": r[1], "win": bool(r[2]), "payout": r[3]} for r in c.fetchall()]
+            c.execute("SELECT COUNT(*), COALESCE(SUM(win),0), MAX(COALESCE(MAX(payout-bet),0),0) "
+                      "FROM upgrader_log WHERE user_id=?", (uid,))
+            st = c.fetchone()
         return web.json_response({
+            "history": hist, "stats": {"spins": st[0], "wins": st[1], "best": st[2]},
             "coins": (row[0] if row else 0) or 0, "min": MIN_BET, "max": MAX_BET,
             "mults": [{"m": m, "chance": chance_of(m)} for m in MULTS],
             "prize": {"name": it[1], "chance": PRIZE_CHANCE, "min_bet": PRIZE_MIN_BET} if it else None,
         })
+
+    async def top(request):
+        uid = auth(request)
+        async with db_lock:
+            c = db.cursor()
+            c.execute("SELECT user_id, coins FROM users WHERE coins>0 AND COALESCE(blacklisted,0)=0 "
+                      "ORDER BY coins DESC, user_id LIMIT 10")
+            rows = c.fetchall()
+            c.execute("SELECT coins, COALESCE(blacklisted,0) FROM users WHERE user_id=?", (uid,))
+            me = c.fetchone()
+            rank = None
+            if me and (me[0] or 0) > 0 and me[1] == 0:
+                c.execute("SELECT COUNT(*)+1 FROM users WHERE coins>? AND COALESCE(blacklisted,0)=0", (me[0],))
+                rank = c.fetchone()[0]
+        return web.json_response({
+            "top": [{"n": i + 1, "name": "Игрок •••" + str(r[0])[-3:], "coins": r[1], "me": r[0] == uid}
+                    for i, r in enumerate(rows)],
+            "rank": rank})
 
     async def upgrade(request):
         uid = auth(request)
@@ -4732,6 +4775,7 @@ def register_api(app, *, token, db, db_lock, check_sub, get_bot_username):
     app.router.add_post("/api/promo", promo)
     app.router.add_get("/api/upgrade/config", up_config)
     app.router.add_post("/api/upgrade", upgrade)
+    app.router.add_get("/api/top", top)
     app.router.add_route("OPTIONS", "/api/{tail:.*}", lambda r: web.Response())
 
 
