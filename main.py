@@ -16,7 +16,7 @@ from urllib.parse import parse_qsl
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, ChatJoinRequest, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, ChatMemberUpdated, ChatJoinRequest, BufferedInputFile, MenuButtonWebApp, WebAppInfo
 from aiogram.filters import ChatMemberUpdatedFilter, JOIN_TRANSITION, LEAVE_TRANSITION
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -4938,11 +4938,29 @@ async def on_user_leave_channel(event: ChatMemberUpdated):
             pass
 
 
+MINIAPP_URL = os.environ.get("MINIAPP_URL", "https://daigazunazamenkax-lgtm.github.io/miniapp/")
+
+
+async def set_miniapp_button():
+    """Сам выставляет кнопку меню мини-аппа с актуальным доменом Railway (переменные вручную не нужны)."""
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("MINIAPP_API_HOST")
+    if not domain:
+        print("miniapp: нет RAILWAY_PUBLIC_DOMAIN (создай домен в Railway → Networking), кнопка не обновлена")
+        return
+    url = f"{MINIAPP_URL}?api=https://{domain}&v={int(time.time())}"
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="Открыть", web_app=WebAppInfo(url=url)))
+        print("miniapp: кнопка меню обновлена ->", url)
+    except Exception as e:
+        print("miniapp: не удалось выставить кнопку:", e)
+
+
 async def main():
 
     print("BOT STARTED")
 
     await notify_admins_on_start()
+    await set_miniapp_button()
 
     await asyncio.gather(
         run_web(),
